@@ -19,6 +19,7 @@ import collections
 import contextlib
 import ipaddress
 import logging
+import math
 import os
 import socket
 import sys
@@ -36,7 +37,20 @@ HOLD_RATE_HZ = 50.0
 HOLD_CONFIRM_WINDOW_S = 0.2
 MAX_BOOST_S = 30.0
 MAX_DRIVE_S = 10.0
+MIN_HOLD_S = 0.05               # shorter holds are refused (bad_argument): they would send at most one packet
 HELLO_CACHE_S = 2.0
+HELLO_MIN_INTERVAL_S = 1.0      # unsolicited hellos (session changes) at most this often, one at a time
+HOLD_ID_MEMORY = 256            # request ids a hold remembers (5 s at 50 Hz) to match a late Error to it
+PAUSE_AFTER_S = 1.5             # session_time unchanged this long (wall clock) while packets arrive: paused
+STOPPED_AFTER_S = 3.0           # no telemetry packet at all for this long: stopped (not paused)
+OLDER_FRAME_GRACE_S = 0.5       # an older frame is dropped only while the kept one is younger than this (T2)
+WAIT_MAX_DEFAULT_S = 55.0       # default cap for wait_for_trigger's timeout
+WAIT_MAX_CEILING_S = 60.0       # hard ceiling: some clients (Claude desktop) cut tool calls at ~80 s
+# What each command may be answered with (README, Commands): anything else is a protocol failure.
+EXPECTED_REPLY = {P.CMD_HELLO: ("hello",), P.CMD_DRIVE: ("error",), P.CMD_BOOST: ("error",)}
+DEFAULT_EXPECTED_REPLY = ("ack", "error")
+# Commands whose effect is unknown when no reply comes (the game may have applied it).
+_STATEFUL = ("pick_card", "ban_card", "set_pit", "pick_tire")
 TRIGGER_SAMPLE_HZ = 10.0
 # packet types the trigger engine needs; the high-rate ones are sampled at TRIGGER_SAMPLE_HZ
 _TRIGGER_SAMPLED = (P.PKT_PLAYER, P.PKT_CAR_TELEMETRY, P.PKT_LAP_DATA, P.PKT_CAR_ABILITIES)
@@ -60,6 +74,11 @@ def is_loopback(host):
         return False
 
 
+def _capped_wait(value):
+    """BC_WAIT_MAX_S can only lower the ceiling; NaN / non-positive values are left for validate() to refuse."""
+    return min(value, WAIT_MAX_CEILING_S) if value == value else value
+
+
 def _default_results_dir():
     return os.path.join(os.path.expanduser("~"), ".backseat-champions-mcp", "race-results")
 
@@ -78,11 +97,12 @@ class Config:
     results_token: str = ""
     results_dir: str = field(default_factory=_default_results_dir)
     results_host: str = "127.0.0.1"
+    results_keep: int = 100          # uploads kept by the results receiver (oldest deleted); 0 keeps all
     game_host: str = ""              # where telemetry may come from when listening off loopback; default command_host
     command_timeout: float = 1.0
     telemetry_reuse: str = "auto"    # auto | on | off: SO_REUSEADDR / SO_REUSEPORT on the telemetry socket
     event_buffer: int = 500
-    wait_max_s: float = 300.0        # cap for wait_for_trigger's timeout
+    wait_max_s: float = WAIT_MAX_DEFAULT_S   # cap for wait_for_trigger's timeout: min(BC_WAIT_MAX_S, 60)
     triggers: TriggerConfig = field(default_factory=TriggerConfig)
 
     @classmethod
@@ -118,10 +138,11 @@ class Config:
             results_token=env.get("BC_RESULTS_TOKEN") or "",
             results_dir=(env.get("BC_RESULTS_DIR") or "").strip() or _default_results_dir(),
             results_host=(env.get("BC_RESULTS_HOST") or "127.0.0.1").strip(),
+            results_keep=integer("BC_RESULTS_KEEP", 100),
             game_host=(env.get("BC_GAME_HOST") or "").strip(),
             command_timeout=number("BC_COMMAND_TIMEOUT", 1.0),
             telemetry_reuse=(env.get("BC_TELEMETRY_REUSE") or "auto").strip().lower(),
-            wait_max_s=number("BC_WAIT_MAX_S", 300.0),
+            wait_max_s=_capped_wait(number("BC_WAIT_MAX_S", WAIT_MAX_DEFAULT_S)),
             triggers=TriggerConfig.from_env(env),
         )
 
@@ -145,8 +166,13 @@ class Config:
             self.telemetry_reuse = "off"
         if self.telemetry_reuse not in ("auto", "on", "off"):
             raise ValueError("BC_TELEMETRY_REUSE must be auto, on or off")
-        if not (1.0 <= self.wait_max_s <= 3600.0):
-            raise ValueError("BC_WAIT_MAX_S must be between 1 and 3600 seconds")
+        if not (self.wait_max_s > 0):            # also rejects NaN
+            raise ValueError("BC_WAIT_MAX_S must be a positive number of seconds (it can only lower the %g s cap)"
+                             % WAIT_MAX_CEILING_S)
+        # A hard ceiling, not a range: a longer wait would be cut by the client and its result lost (L1/L4).
+        self.wait_max_s = min(float(self.wait_max_s), WAIT_MAX_CEILING_S)
+        if self.results_keep < 0:
+            raise ValueError("BC_RESULTS_KEEP must be 0 (keep all) or a positive number of uploads")
         if self.results_port is not None and not is_loopback(self.results_host) and not self.results_token:
             raise ValueError("refusing to receive race results on %s without BC_RESULTS_TOKEN: anyone who can reach "
                              "it could upload" % self.results_host)
@@ -217,11 +243,24 @@ class _Hold:
         self.started = time.time()
         self.started_mono = time.monotonic()
         self.packets_sent = 0
+        self.sent_ids = collections.deque(maxlen=HOLD_ID_MEMORY)    # request ids this hold sent, newest last
+        self._sent_set = set()
         self.task = None
         self.error = None
-        self.ended = None            # None while running; else expired | stopped | replaced | error | shutdown
+        self.ended = None            # None while running; else expired | stopped | replaced | error | shutdown |
+        #                              session_ended (SEND / FINI for seat 0) | session_changed (new session_uid)
         self.ended_mono = None
         self.reported = False
+
+    def remember(self, request_id):
+        """Note a request id this hold sent; only an Error echoing one of these ends the hold."""
+        if len(self.sent_ids) == self.sent_ids.maxlen:
+            self._sent_set.discard(self.sent_ids[0])
+        self.sent_ids.append(request_id)
+        self._sent_set.add(request_id)
+
+    def sent(self, request_id):
+        return request_id in self._sent_set
 
     def finish(self, reason):
         if self.ended is None:
@@ -243,6 +282,17 @@ class _Hold:
         if self.error:
             out["error"] = self.error
         return out
+
+
+def pick_address(infos, host="?"):
+    """From ``getaddrinfo`` results, the first IPv4 address, else the first one: ``(family, sockaddr)``."""
+    infos = [i for i in infos if i[0] in (socket.AF_INET, socket.AF_INET6)]
+    if not infos:
+        raise OSError("no IPv4 or IPv6 address for %s" % host)
+    for info in infos:
+        if info[0] == socket.AF_INET:
+            return info[0], info[4][:2]
+    return infos[0][0], infos[0][4]
 
 
 def failure(reason, command=None, detail=None, **extra):
@@ -269,16 +319,25 @@ class GameClient:
         self._tele_transport = None
         self.listener_error = None       # why the telemetry socket could not be bound, as text
         self.listener_errno = None
+        self.bind_attempts = 0
+        self.started_at = None
         self.telemetry_port = config.telemetry_port
         self._allowed_sources = None     # None: accept from anyone (loopback listener)
         self._cache = {}                 # (packet_id, key) -> _Entry
         self.session_uid = None
+        self._old_uids = collections.deque(maxlen=16)   # sessions already replaced: their packets are dropped
         self.seat_car = [None, None, None, None]
         self.num_cars = 0
         self.game_version = None
         self.last_packet = None          # monotonic time of the last telemetry packet
         self.counts = collections.Counter()
+        self.last_seen = {}              # packet id -> monotonic time it last arrived
+        self._st_value = None            # the newest header session_time ...
+        self._st_changed = None          # ... and the monotonic time it last changed
+        self._st_back = None             # a session_time below _st_value seen since (clock stepped back or late)
+        self.session_end = None          # SEND / FINI (seat 0) event code once this session has ended for seat 0
         self.dropped = collections.Counter()
+        self.version_mismatch = None     # text of the last packet dropped for an unknown packet_version
         self.sessions_seen = 0
 
         # events and decisions
@@ -295,11 +354,15 @@ class GameClient:
         self._pending = {}
         self._request_id = (int(time.time() * 1000) ^ (os.getpid() << 16)) & 0x7FFFFFFF
         self._hello = None               # (monotonic time, result dict)
+        self._hello_task = None          # the unsolicited (background) hello in flight
+        self._hello_refreshed = -1e9     # monotonic time the last unsolicited hello was started
+        self._hello_deferred = None      # TimerHandle of the one refresh postponed by the rate limit
         self.commands_sent = 0
         self.last_reply = None
 
         # holds
         self.holds = {"boost": None, "drive": None}
+        self._hold_gen = {"boost": 0, "drive": 0}   # bumped by every start / stop: a start that lost the race yields
 
         self._background = set()
 
@@ -310,35 +373,72 @@ class GameClient:
     # ------------------------------------------------------------------------------------------ lifecycle
 
     async def start(self):
-        """Bind the telemetry socket. Never raises: a failed bind is kept in ``listener_error`` for the tools."""
+        """Bind the telemetry socket. Never raises: a failed bind is kept in ``listener_error`` for the tools and
+        retried in the background every BIND_RETRY_S seconds, so the server picks the port up once it is free."""
         if self.started:
             return
         self.started = True
         self._loop = asyncio.get_running_loop()
+        self.started_at = time.time()
+        if not await self._try_bind():
+            self._background.add(self._loop.create_task(self._bind_retry_loop()))
+        self._refresh_hello()
+
+    BIND_RETRY_S = 2.0
+
+    async def _try_bind(self):
+        self.bind_attempts += 1
         try:
             sock = self._telemetry_socket()
             self._tele_transport, _ = await self._loop.create_datagram_endpoint(
                 lambda: _TelemetryProtocol(self), sock=sock)
-            self.listener_error = None
-            self.telemetry_port = sock.getsockname()[1]
-            log.info("listening for telemetry on %s:%d", self.config.telemetry_host, self.telemetry_port)
         except (OSError, ValueError) as e:
             self._tele_transport = None
+            first = self.listener_error is None
             self.listener_error = str(e)
             self.listener_errno = getattr(e, "errno", None)
-            log.warning("cannot listen for telemetry on %s:%d: %s", self.config.telemetry_host,
-                        self.config.telemetry_port, e)
-        self._refresh_hello()
+            if first:
+                log.warning("cannot listen for telemetry on %s:%d: %s (retrying every %.0f s)",
+                            self.config.telemetry_host, self.config.telemetry_port, e, self.BIND_RETRY_S)
+            return False
+        self.listener_error = None
+        self.listener_errno = None
+        self.telemetry_port = sock.getsockname()[1]
+        log.info("listening for telemetry on %s:%d", self.config.telemetry_host, self.telemetry_port)
+        return True
+
+    async def _bind_retry_loop(self):
+        while self.started and self._tele_transport is None:
+            await asyncio.sleep(self.BIND_RETRY_S)
+            if self.started and self._tele_transport is None and await self._try_bind():
+                self._refresh_hello()
 
     def _refresh_hello(self):
         """Ask the game what is switched on, in the background (tells the trigger engine about Decision Events)."""
         if self._loop is None or not self.started:
             return
+        now = time.monotonic()
+        task = self._hello_task
+        if task is not None and not task.done():
+            self.dropped["hello refresh already in flight"] += 1
+            return                               # one unsolicited hello in flight at most
+        if now - self._hello_refreshed < HELLO_MIN_INTERVAL_S:
+            self.dropped["hello refresh rate-limited"] += 1
+            # one deferred refresh, so the last session change of a burst is still asked about
+            if self._hello_deferred is None:
+                def again():
+                    self._hello_deferred = None
+                    self._refresh_hello()
+                self._hello_deferred = self._loop.call_later(
+                    HELLO_MIN_INTERVAL_S - (now - self._hello_refreshed) + 0.01, again)
+            return
+        self._hello_refreshed = now
 
         async def run():
             with contextlib.suppress(Exception):
                 await self.hello(max_age=0)
-        self._background.add(self._loop.create_task(run()))
+        self._hello_task = self._loop.create_task(run())
+        self._background.add(self._hello_task)
         self._background = {t for t in self._background if not t.done()}
 
     async def stop(self):
@@ -348,12 +448,15 @@ class GameClient:
         self.started = False
         for kind in list(self.holds):
             self._end_hold(kind, "shutdown", release=True)
+        if self._hello_deferred is not None:
+            self._hello_deferred.cancel()
+            self._hello_deferred = None
         for task in list(self._background):
             task.cancel()
-        for waiter in list(self._event_waiters) + list(self.triggers._waiters):
+        for waiter in list(self._event_waiters) + list(getattr(self.triggers, "_waiters", ())):
             if not waiter.done():
                 waiter.cancel()
-        for future in list(self._pending.values()):
+        for future, _ in list(self._pending.values()):
             if not future.done():
                 future.cancel()
         if self._tele_transport is not None:
@@ -418,6 +521,13 @@ class GameClient:
                 return
         try:
             header = P.peek_header(data)
+        except P.PacketVersionError as e:
+            # a layout this codec does not read: decoding it with the known layout would give wrong values
+            if not self.dropped["unknown packet_version"]:
+                log.warning("dropping telemetry with an unknown packet_version: %s", e)
+            self.dropped["unknown packet_version"] += 1
+            self.version_mismatch = str(e)
+            return
         except P.PacketError:
             self.dropped["not a Game API packet"] += 1
             return
@@ -427,17 +537,35 @@ class GameClient:
             return
         now = time.monotonic()
         if header["session_uid"] != self.session_uid:
+            if header["session_uid"] in self._old_uids:
+                # a late or stray packet of a session that has already been replaced: it must not take over
+                self.dropped["packet from an earlier session"] += 1
+                return
             self._new_session(header["session_uid"])
+        key = P.peek_keys(data) if pid in (P.PKT_PLAYER, P.PKT_RACING_LINE, P.PKT_AI_OBSERVATIONS) else 0
+        if pid == P.PKT_AI_OBSERVATIONS and not (0 <= key < P.MAX_CARS):
+            self.dropped["car index out of range"] += 1
+            return
+        old = self._cache.get((pid, key))
+        if old is not None and header["frame"] < old.header["frame"] \
+                and now - old.received < OLDER_FRAME_GRACE_S:
+            # reordered datagrams: keep the newest tick. Only while the kept one is fresh, so a frame counter that
+            # starts again (or a kept packet with a bogus huge frame) cannot block a packet type for good.
+            self.dropped["older frame than the one kept"] += 1
+            return
         self.seat_car = header["seat_car"]
         self.num_cars = min(header["num_cars"], P.MAX_CARS)
         self.game_version = header["game_version"]
         self.last_packet = now
+        self.last_seen[pid] = now
         self.counts[pid] += 1
+        st = header["session_time"]
+        if math.isfinite(st):
+            self._note_session_time(st, now)
         if pid == P.PKT_EVENT:
             body = self._on_event(data, header, now)
             self._feed_triggers(pid, header, body, now)
             return
-        key = P.peek_keys(data) if pid in (P.PKT_PLAYER, P.PKT_RACING_LINE, P.PKT_AI_OBSERVATIONS) else 0
         entry = _Entry(data, header, now)
         self._cache[(pid, key)] = entry
         if pid in _TRIGGER_ALWAYS or (pid in _TRIGGER_SAMPLED and key == 0
@@ -450,6 +578,26 @@ class GameClient:
                 return
             self._feed_triggers(pid, header, entry.body, now)
 
+    def _note_session_time(self, st, now):
+        """Track when session_time last moved; only a frozen clock may later read as a pause.
+
+        An advance counts at once. A single older value does not (a late datagram must not end a pause), but a
+        clock that stepped back and runs on from there does: a second older value above the first one is time
+        moving, however small the step back was. A step back of more than 5 s counts at once.
+        """
+        prev = self._st_value
+        if prev is None or st > prev or st < prev - 5.0:
+            self._st_value = st
+            self._st_changed = now
+            self._st_back = None
+        elif st < prev:
+            if self._st_back is not None and self._st_back < st:
+                self._st_value = st          # running again from below the newest value
+                self._st_changed = now
+                self._st_back = None
+            else:
+                self._st_back = st
+
     def _feed_triggers(self, pid, header, body, now):
         try:
             self.triggers.feed(pid, header, body, now)
@@ -459,10 +607,18 @@ class GameClient:
     def _new_session(self, uid):
         if self.session_uid is not None:
             log.info("session %s -> %s: telemetry cache reset", self.session_uid, uid)
+            self._old_uids.append(self.session_uid)
+            # a hold belongs to the session it was started in: let go (with the release) when another one starts
+            self._end_holds("session_changed")
         self.session_uid = uid
         self.sessions_seen += 1
         self._cache.clear()
         self._trigger_fed.clear()
+        self.last_seen = {}
+        self._st_value = None
+        self._st_changed = None
+        self._st_back = None
+        self.session_end = None
         self._refresh_hello()
         self.card_event = None
         self.tire_event = None
@@ -491,6 +647,52 @@ class GameClient:
     def in_session(self):
         age = self.telemetry_age()
         return age is not None and age < 3.0
+
+    def paused(self):
+        """Whether the game is paused: ``{paused, session_time_frozen_for_s, session_time_s, note, stopped,
+        telemetry_age_s, session_ended}``.
+
+        The game stops time in a pause (for instance while a card hand waits for the player): then only Session,
+        Car Status (2 Hz, with Driver Data) and Participants keep arriving, the configured-rate packets stop, and
+        session_time does not advance. Detected as: packets still arriving (the newest less than STOPPED_AFTER_S
+        old) while the header's session_time has not advanced for PAUSE_AFTER_S seconds of wall clock. No packet at
+        all for STOPPED_AFTER_S is "stopped", not paused. Once SEND (or FINI for seat 0) has been seen in this
+        session, a frozen clock is the session's end: ``session_ended`` is true and ``paused`` false. Knows nothing
+        about cards: the caller adds what the trigger engine knows about the hand.
+        """
+        now = time.monotonic()
+        age = None if self.last_packet is None else now - self.last_packet
+        ended = self.session_end is not None
+        out = {"paused": False, "session_time_frozen_for_s": 0.0,
+               "session_time_s": None if self._st_value is None else round(self._st_value, 2),
+               "note": None, "stopped": age is None or age >= STOPPED_AFTER_S,
+               "telemetry_age_s": None if age is None else round(age, 2), "session_ended": ended}
+        if out["stopped"]:
+            if age is not None:
+                out["note"] = ("No telemetry for %.1f s: the session is over, the game was closed or the switch was "
+                               "turned off (a paused game still sends Session, and Car Status when Driver Data is "
+                               "on)." % age)
+            return out
+        if self._st_changed is None:
+            return out
+        frozen = now - self._st_changed
+        out["session_time_frozen_for_s"] = round(frozen, 1)
+        if ended:
+            if frozen >= PAUSE_AFTER_S:
+                out["note"] = ("The session has ended (%s seen): session_time not advancing for %.1f s is the end "
+                               "of the session, not a pause." % (self.session_end, frozen))
+            return out
+        if frozen >= PAUSE_AFTER_S:
+            out["paused"] = True
+            out["note"] = ("session_time not advancing for %.1f s while packets still arrive: the game is paused. "
+                           "The configured-rate packets (Motion, Car Telemetry, Lap Data, Player, Car Abilities, "
+                           "Racing Line) stop during a pause, so their last values are frozen, not lost." % frozen)
+        return out
+
+    def packet_ages(self):
+        """Seconds since each packet type last arrived in this session."""
+        now = time.monotonic()
+        return {P.PACKET_NAMES[pid]: round(now - t, 2) for pid, t in sorted(self.last_seen.items())}
 
     @staticmethod
     def stale_after(packet_id):
@@ -525,9 +727,14 @@ class GameClient:
                     self.tire_event = None   # laps are being counted: the pre-race tire screen is over
             elif code == "FINI":
                 self.tire_event = None
+                if self.session_end is None:
+                    self.session_end = code
+                self._end_holds("session_ended")
         if code == "SEND":
             self.card_event = None
             self.tire_event = None
+            self.session_end = code
+            self._end_holds("session_ended")
         for waiter in list(self._event_waiters):
             if not waiter.done():
                 waiter.set_result(None)
@@ -588,13 +795,29 @@ class GameClient:
         if protocol is not None and protocol.transport is not None:
             protocol.transport.close()
         self._cmd_stale = False
-        host = self.config.command_host
-        family = socket.AF_INET6 if ":" in host else socket.AF_UNSPEC
+        family, address = await self._command_address()
         # Connected, so the system only hands us datagrams that come from the game's command address.
         _, protocol = await self._loop.create_datagram_endpoint(
-            lambda: _CommandProtocol(self), remote_addr=(host, self.config.command_port), family=family)
+            lambda: _CommandProtocol(self), remote_addr=address, family=family)
         self._cmd_protocol = protocol
         return protocol.transport
+
+    async def _command_address(self):
+        """``(family, sockaddr)`` of the game's command port. An IP literal is used as given; a name is looked up
+        with IPv4 first, because the game listens on 127.0.0.1 by default while ``localhost`` may resolve to ::1
+        first (and the game itself prefers IPv4 for names)."""
+        host, port = self.config.command_host, self.config.command_port
+        literal = host.split("%", 1)[0]
+        try:
+            ip = ipaddress.ip_address(literal)
+        except ValueError:
+            ip = None
+        if ip is not None:
+            if ip.version == 6:
+                return socket.AF_INET6, (host, port)
+            return socket.AF_INET, (host, port)
+        infos = await self._loop.getaddrinfo(host, port, type=socket.SOCK_DGRAM)
+        return pick_address(infos, host)
 
     def _on_command_socket_error(self, protocol, exc):
         if protocol is not self._cmd_protocol:
@@ -605,7 +828,7 @@ class GameClient:
         refused = isinstance(exc, (ConnectionRefusedError, ConnectionResetError))
         reason = "game_unreachable" if refused else "send_failed"
         detail = "(%s:%d: %s)" % (self.config.command_host, self.config.command_port, exc)
-        for future in list(self._pending.values()):
+        for future, _ in list(self._pending.values()):
             if not future.done():
                 future.set_result(("local", {"reason": reason, "detail": detail}))
         for kind, hold in self.holds.items():
@@ -629,17 +852,33 @@ class GameClient:
         self.last_reply = time.monotonic()
         self.game_version = header["game_version"]
         kind = P.PACKET_NAMES[pid]
-        future = self._pending.get(body["request_id"])
-        if future is not None:
+        pending = self._pending.get(body["request_id"])
+        if pending is not None:
+            future, command_name = pending
+            if kind in ("ack", "error") and body["command"] != command_name \
+                    and not (kind == "error" and body["command"] is None):
+                # An Ack / Error naming another command than the one sent with this id: not credited.
+                self.dropped["reply for another command"] += 1
+                log.warning("dropped a %s for %s carrying the request id of a %s", kind, body["command"],
+                            command_name)
+                return
             if not future.done():
                 future.set_result((kind, body))
             return
-        # An Error nobody waits for: the hold loops' own packets are only ever answered with errors.
+        # An Error nobody waits for: the hold loops' own packets are only ever answered with errors. Only an
+        # Error echoing a request id the current hold sent ends it (a late one from a replaced hold must not).
         if pid == P.PKT_ERROR and body["command"] in ("boost", "drive"):
             hold = self.holds.get(body["command"])
-            if hold is not None and hold.ended is None:
-                hold.error = failure(body["reason"], body["command"])
+            if hold is not None and hold.ended is None and hold.sent(body["request_id"]):
+                hold.error = failure(body["reason"], body["command"], request_id=body["request_id"],
+                                     error_code=body["reason_code"])
                 self._end_hold(body["command"], "error", release=False)
+            else:
+                self.dropped["error for no current hold"] += 1
+                log.info("ignored a %s Error (%s) for request %s: not sent by the current hold",
+                         body["command"], body["reason"], body["request_id"])
+        elif pid != P.PKT_HELLO:
+            self.dropped["reply nobody waits for"] += 1
 
     async def request(self, command_id, build=None, timeout=None):
         """Send one command and wait for the reply with its request id.
@@ -654,7 +893,7 @@ class GameClient:
         data = (build(request_id, self._token) if build is not None
                 else P.encode_command(command_id, b"", request_id, self._token))
         future = self._loop.create_future()
-        self._pending[request_id] = future
+        self._pending[request_id] = (future, name)
         started = time.monotonic()
         try:
             transport = await self._command_transport()
@@ -662,8 +901,14 @@ class GameClient:
             self.commands_sent += 1
             kind, body = await asyncio.wait_for(future, timeout)
         except asyncio.TimeoutError:
-            return failure("no_reply", name, "(no reply from %s:%d within %.2f s)"
-                           % (self.config.command_host, self.config.command_port, timeout), request_id=request_id)
+            out = failure("no_reply", name, "(no reply from %s:%d within %.2f s)"
+                          % (self.config.command_host, self.config.command_port, timeout), request_id=request_id)
+            if name in _STATEFUL:
+                out["outcome_unknown"] = True
+                out["hint"] = getattr(R, "OUTCOME_UNKNOWN_HINT", None) or (
+                    "No reply, so the outcome is unknown: the game may have applied the command and the reply was "
+                    "lost. Check get_pending_decisions / get_player_state before retrying.")
+            return out
         except OSError as e:
             self._cmd_stale = True
             return failure("send_failed", name, "(%s:%d: %s)" % (self.config.command_host,
@@ -673,6 +918,12 @@ class GameClient:
         latency = round((time.monotonic() - started) * 1000, 1)
         if kind == "local":
             return failure(body["reason"], name, body["detail"])
+        expected = EXPECTED_REPLY.get(command_id, DEFAULT_EXPECTED_REPLY)
+        if kind not in expected:
+            self.dropped["wrong reply kind"] += 1
+            return failure("protocol_error", name, "(%s was answered with %s; expected %s)"
+                           % (name, kind.capitalize(), " or ".join(k.capitalize() for k in expected)),
+                           request_id=request_id, reply_kind=kind, latency_ms=latency)
         if kind == "error":
             return failure(body["reason"], name, request_id=request_id, error_code=body["reason_code"],
                            latency_ms=latency)
@@ -690,7 +941,7 @@ class GameClient:
         name = P.COMMAND_NAMES[command_id]
         request_id = self._next_request_id()
         future = self._loop.create_future()
-        self._pending[request_id] = future
+        self._pending[request_id] = (future, name)
         started = time.monotonic()
         try:
             transport = await self._command_transport()
@@ -714,7 +965,9 @@ class GameClient:
             return failure(body["reason"], name, body["detail"])
         if kind == "error":
             return failure(body["reason"], name, request_id=request_id, error_code=body["reason_code"])
-        return {"ok": True, "command": name, "request_id": request_id}
+        self.dropped["wrong reply kind"] += 1
+        return failure("protocol_error", name, "(%s was answered with %s; the game answers it only with Error)"
+                       % (name, kind.capitalize()), request_id=request_id, reply_kind=kind)
 
     async def hello(self, max_age=HELLO_CACHE_S, timeout=None):
         """The game's Hello (what is switched on), cached briefly. ``{ok: True, hello: {...}}`` or a failure."""
@@ -723,7 +976,9 @@ class GameClient:
             return self._hello[1]
         result = await self.request(P.CMD_HELLO, timeout=timeout if timeout is not None
                                     else min(self.config.command_timeout, 0.6))
-        self._hello = (time.monotonic(), result)
+        if result.get("ok") or result.get("error_reason") in ("no_reply", "game_unreachable", "send_failed"):
+            # a wrong-kind or refused hello is never cached: the next call asks again
+            self._hello = (time.monotonic(), result)
         if result.get("ok"):
             self.triggers.set_decision_events(result["hello"]["decision_events"])
         return result
@@ -798,7 +1053,8 @@ class GameClient:
         """Keep the open decisions in step with a command's outcome."""
         reason = result.get("error_reason")
         if command == "pick_card":
-            if result["ok"] or reason in ("no_points", "cards_unavailable"):
+            # cards_unavailable leaves the hand open (seen in the pit lane: the same pick worked seconds later)
+            if result["ok"] or reason == "no_points":
                 self.card_event = None       # a new hand arrives as a new CARD event
         elif command == "ban_card":
             if result["ok"] and self.card_event is not None and index is not None:
@@ -832,17 +1088,34 @@ class GameClient:
         if release and hold.release_packet is not None:
             self._send_now(hold.release_packet(self._next_request_id()))
 
-    async def _hold_loop(self, hold):
+    def _end_holds(self, reason):
+        """End every running hold and send its release (session over or replaced by another session)."""
+        for kind, hold in self.holds.items():
+            if hold is not None and hold.ended is None:
+                log.info("%s hold ended: %s", kind, reason)
+                self._end_hold(kind, reason, release=True)
+
+    def _send_hold_packet(self, hold, transport):
+        rid = self._next_request_id()
+        hold.remember(rid)
+        transport.sendto(hold.make_packet(rid))
+        self.commands_sent += 1
+        hold.packets_sent += 1
+
+    async def _hold_loop(self, hold, first_sent=False):
+        """Re-send the hold's packet every 1/HOLD_RATE_HZ s until it ends. With ``first_sent`` the caller already
+        sent the first one (at ``hold.started_mono``), so the loop starts one period later."""
         period = 1.0 / HOLD_RATE_HZ
         loop = self._loop
-        end = loop.time() + hold.duration
+        end = loop.time() + hold.duration - (time.monotonic() - hold.started_mono if first_sent else 0.0)
         next_tick = loop.time()
         try:
+            if first_sent:
+                next_tick += period
+                await asyncio.sleep(period)
             while hold.ended is None and loop.time() < end:
                 transport = await self._command_transport()
-                transport.sendto(hold.make_packet(self._next_request_id()))
-                self.commands_sent += 1
-                hold.packets_sent += 1
+                self._send_hold_packet(hold, transport)
                 next_tick += period
                 delay = next_tick - loop.time()
                 if delay < -5 * period:          # fell far behind (a stalled loop): do not burst to catch up
@@ -867,38 +1140,86 @@ class GameClient:
     async def start_hold(self, kind, describe, make_packet, release_packet, duration):
         """Start re-sending a boost or drive command at 50 Hz for ``duration`` seconds, replacing a running one.
 
-        Returns once the game had a moment to refuse it: a failure dict if it did (or if the game does not answer
-        a ping), else ``{ok: True, hold: {...}}``. The hold keeps running in the background after this returns.
+        The liveness ping goes out first, while a running hold keeps going; only once the game answered is the
+        running hold swapped for the new one, in one step (the new hold's first packet is sent at once, so the game
+        never sees a gap). If the ping fails, a running hold is kept and the failure is returned
+        (``kept_running_hold``). Returns once the game had a moment to refuse it: a failure dict if it did, else
+        ``{ok: True, hold: {...}}``. The hold keeps running in the background after this returns.
         """
-        self._end_hold(kind, "replaced", release=False)
-        hold = _Hold(kind, describe, make_packet, release_packet, duration)
-        self.holds[kind] = hold
-        started = time.monotonic()
+        if not (duration >= MIN_HOLD_S):         # also NaN
+            return failure("bad_argument", kind, "(duration %r s: a hold must last at least %g s)"
+                           % (duration, MIN_HOLD_S), packets_sent=0)
+        self._hold_gen[kind] += 1
+        gen = self._hold_gen[kind]
+        running = self.holds.get(kind)
+        running = running if running is not None and running.ended is None else None
+
+        def failed(out):
+            out = dict(out)
+            out["command"] = kind
+            out["packets_sent"] = 0
+            if running is not None and running.ended is None:
+                out["kept_running_hold"] = True
+                out["note"] = ("Nothing new was held; the %s hold already running was kept (%s)."
+                               % (kind, ", ".join("%s=%s" % kv for kv in sorted(running.describe.items()))))
+                return out
+            hold = _Hold(kind, describe, make_packet, release_packet, duration)
+            hold.error = out
+            hold.finish("error")
+            hold.reported = True
+            if self._hold_gen[kind] == gen:
+                self.holds[kind] = hold
+            return out
+
         try:
             await self._command_transport()
         except OSError as e:
+            return failed(failure("send_failed", kind, "(%s)" % e))
+        # Confirm the game answers before sending anything, so a silent game never gets a burst of commands that
+        # is then left without its release.
+        ping = await self.request(P.CMD_PING, timeout=min(self.config.command_timeout, 0.5))
+        if not ping["ok"]:
+            out = failed(ping)
+            out.setdefault("note", "Nothing was held: the liveness ping sent first got no answer, so no %s was "
+                                   "sent." % kind)
+            return out
+        if self._hold_gen[kind] != gen or not self.started:     # another start or a stop came while the ping was out
+            return {"ok": False, "command": kind, "error_reason": "replaced",
+                    "explanation": "Another %s call or a stop replaced this one before it started." % kind,
+                    "hint": "Check get_api_status (holds).", "packets_sent": 0}
+        try:
+            transport = await self._command_transport()
+        except OSError as e:
+            return failed(failure("send_failed", kind, "(%s)" % e))
+        # The swap: nothing below awaits until the new hold's first packet is out.
+        hold = _Hold(kind, describe, make_packet, release_packet, duration)
+        self._end_hold(kind, "replaced", release=False)
+        self.holds[kind] = hold
+        try:
+            self._send_hold_packet(hold, transport)
+        except OSError as e:
+            self._cmd_stale = True
             hold.error = failure("send_failed", kind, "(%s)" % e)
             hold.finish("error")
             hold.reported = True
-            return hold.error
-        hold.task = asyncio.ensure_future(self._hold_loop(hold))
-        ping = await self.request(P.CMD_PING, timeout=min(self.config.command_timeout, 0.5))
-        if hold.error is None and not ping["ok"]:
-            ping["command"] = kind
-            hold.error = ping
-            self._end_hold(kind, "error", release=False)
+            return dict(hold.error, packets_sent=0)
+        started = time.monotonic()
+        hold.task = asyncio.ensure_future(self._hold_loop(hold, first_sent=True))
         remaining = HOLD_CONFIRM_WINDOW_S - (time.monotonic() - started)
         if hold.error is None and remaining > 0:
             await asyncio.sleep(remaining)
         if hold.error is not None:
             hold.reported = True
-            return dict(hold.error)
+            out = dict(hold.error)
+            out["packets_sent"] = hold.packets_sent
+            return out
         return {"ok": True, "command": kind, "hold": hold.summary()}
 
     def stop_hold(self, kind):
         """Stop a running hold and send its release. Returns whether one was running."""
         hold = self.holds.get(kind)
         running = hold is not None and hold.ended is None
+        self._hold_gen[kind] += 1                # a start still waiting for its ping must not begin after this
         if running:
             self._end_hold(kind, "stopped", release=False)
         return running
@@ -926,13 +1247,23 @@ class GameClient:
                "address": "%s:%d" % (self.config.telemetry_host, self.telemetry_port)}
         if self.listener_error:
             out["error"] = self.listener_error
+            out["retrying_every_s"] = self.BIND_RETRY_S
+        out["bind_attempts"] = self.bind_attempts
+        out["server_pid"] = os.getpid()
+        out["server_uptime_s"] = None if self.started_at is None else round(time.time() - self.started_at, 1)
         age = self.telemetry_age()
         out["receiving"] = age is not None and age < 3.0
         out["last_packet_age_s"] = None if age is None else round(age, 2)
         out["packets_received"] = sum(self.counts.values())
         out["packets_by_type"] = {P.PACKET_NAMES[pid]: n for pid, n in sorted(self.counts.items())}
+        out["last_seen_age_s"] = self.packet_ages()
         if self.dropped:
             out["dropped"] = dict(self.dropped)
+        out["packet_version_mismatches"] = self.dropped["unknown packet_version"]
+        if self.version_mismatch:
+            out["warnings"] = ["%d telemetry packets dropped for an unknown packet_version (last: %s): this game "
+                               "version sends a layout this server does not read; update the server."
+                               % (self.dropped["unknown packet_version"], self.version_mismatch)]
         out["session_uid"] = self.session_uid
         out["sessions_seen"] = self.sessions_seen
         out["events_buffered"] = len(self.events)
@@ -947,12 +1278,12 @@ class GameClient:
         if in_use:
             hint = ("Another program is already receiving the game's telemetry on %s: a second copy of this server "
                     "(for instance one started by another MCP client), gameapi_client.py, or another telemetry "
-                    "tool. Close it and restart this server, or add a second telemetry target with its own port "
-                    "in the game (%s) and set BC_TELEMETRY_PORT to it. Commands (pick_card, set_pit, ...) and "
+                    "tool. Close it: this server retries the port every 2 s and connects by itself once it is free. Or add a second telemetry target with its own port "
+                    "in the game (%s) and set BC_TELEMETRY_PORT to it (needs a restart). Commands (pick_card, set_pit, ...) and "
                     "get_api_status still work." % (address, R.SETTINGS_PATH))
         else:
             hint = ("Check BC_TELEMETRY_HOST / BC_TELEMETRY_PORT: the address must belong to this machine and the "
-                    "port must be free. Restart this server after fixing it. Commands and get_api_status still "
+                    "port must be free (the server retries every 2 s). Restart this server after changing the address. Commands and get_api_status still "
                     "work.")
         return {"ok": False, "error_reason": "telemetry_listener_down",
                 "explanation": "This server could not open its telemetry socket on %s (%s), so it receives no race "

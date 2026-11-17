@@ -30,9 +30,11 @@ def free_tcp_port():
 
 
 class Session:
-    def __init__(self, session, progress):
+    def __init__(self, session, progress, messages=None, init=None):
         self.s = session
         self.progress = progress
+        self.messages = messages if messages is not None else []     # every server notification / request
+        self.init = init
 
     async def call(self, name, args=None, timeout=30):
         result = await self.s.call_tool(name, args or {}, read_timeout_seconds=timeout,
@@ -58,11 +60,19 @@ async def mcp_server(telemetry_port, command_port, **env_extra):
     env.update({k: str(v) for k, v in env_extra.items()})
     params = StdioServerParameters(command=sys.executable, args=["-m", "backseat_champions_mcp"], env=env, cwd=ROOT)
     progress = []
+    messages = []
+
+    async def on_message(message):
+        messages.append(message)
+
+    async def on_log(params):
+        messages.append(("log", params))
+
     with open(os.environ.get("BC_TEST_ERRLOG") or os.devnull, "a") as errlog:
         async with stdio_client(params, errlog=errlog) as (r, w):
-            async with ClientSession(r, w) as session:
-                await session.initialize()
-                yield Session(session, progress)
+            async with ClientSession(r, w, message_handler=on_message, logging_callback=on_log) as session:
+                init = await session.initialize()
+                yield Session(session, progress, messages, init)
 
 
 @contextlib.contextmanager
@@ -215,8 +225,17 @@ def test_write_tools_and_error_mapping():
                 game.player_input = False
                 game.broadcast["ai_observations"] = False
                 status = await s.call("get_api_status")
-                off = {o["switch"] for o in status["game"]["switches_off"]}
-                assert off == {"Player Input", "AI Observations"}
+                off = {o["switch"]: o for o in status["game"]["switches_off"]}
+                assert set(off) == {"Player Input", "AI Observations"}
+                assert off["Player Input"]["required"] is True and off["AI Observations"]["required"] is False
+                assert status["game"]["required_switches_off"] == ["Player Input"]          # D1
+                game.player_input = True
+                game.driver_input = False                     # drive tools not registered: not listed (D1)
+                game.broadcast["player_data"] = False         # Car Abilities still has Driver Data (D3)
+                status = await s.call("get_api_status")
+                off = {o["switch"]: o for o in status["game"]["switches_off"]}
+                assert "Driver Input" not in off and "get_car_abilities" not in off["Player Data"]["affects"]
+                assert status["game"]["required_switches_off"] == ["Player Data"]
     run(main())
 
 
@@ -268,6 +287,11 @@ def test_drive_tools_are_gated():
             async with mcp_server(port, game.command_port, BC_ALLOW_DRIVE="1") as s:
                 tools = {t.name: t for t in (await s.s.list_tools()).tools}
                 assert "drive" in tools and "release_drive" in tools
+                game.driver_input = False
+                status = await s.call("get_api_status")
+                off = {o["switch"]: o for o in status["game"]["switches_off"]}
+                assert off["Driver Input"]["required"] is False and status["game"]["required_switches_off"] == []
+                game.driver_input = True
                 assert "achievements" in tools["drive"].description.lower()
                 await wait_receiving(s)
                 t0 = time.monotonic()
@@ -308,8 +332,7 @@ def test_wait_for_event():
 def test_wait_for_trigger_card_damage_tires_timeout_and_session_end():
     async def main():
         with fake_game() as (game, port):
-            async with mcp_server(port, game.command_port, BC_TRIGGERS="card_offer,car_damaged,tires_wont_last,"
-                                                                       "tire_screen") as s:
+            async with mcp_server(port, game.command_port) as s:          # tire_screen is on by default
                 game.points = 0
                 await wait_receiving(s)
                 # timeout (with progress notifications)
@@ -327,9 +350,17 @@ def test_wait_for_trigger_card_damage_tires_timeout_and_session_end():
                 out = await s.call("wait_for_trigger", {"timeout_s": 5})
                 assert out["triggered"] and [t["type"] for t in out["triggers"]] == ["card_offer"]
                 assert out["triggers"][0]["points"] == 2 and out["triggers"][0]["ban_tokens"] == 1
-                # a queued trigger returns at once; delivered ones are not repeated
-                out = await s.call("wait_for_trigger", {"timeout_s": 0.5})
-                assert out["triggered"] is False
+                last = out["last_seq"]
+                # acknowledged: not returned again, but still listed as an open decision on every result
+                out = await s.call("wait_for_trigger", {"timeout_s": 0.5, "since_seq": last})
+                assert out["status"] == "timeout" and out["triggers"] == []
+                assert [d["type"] for d in out["open_decisions"]] == ["card_offer"]
+                assert out["open_decisions"][0]["open"] is True
+                # once it is gone (the Player packet shows no hand) it is no longer open
+                game.points = 0
+                await asyncio.sleep(0.6)
+                out = await s.call("wait_for_trigger", {"timeout_s": 0.5, "since_seq": last})
+                assert out["triggered"] is False and out["open_decisions"] == []
                 # car_damaged: puncture flag
                 game.puncture = True
                 out = await s.call("wait_for_trigger", {"timeout_s": 5})
@@ -337,12 +368,13 @@ def test_wait_for_trigger_card_damage_tires_timeout_and_session_end():
                 assert out["triggers"][0]["signal"] == "puncture" and out["triggers"][0]["heuristic"] is False
                 game.puncture = False
                 # tires_wont_last: laps every 0.6 s, 0.2 health per lap
-                game.start_scenario(lap_s=0.6, wear_per_lap=0.2, start_health=0.95, total_laps=30, lap=0)
+                game.pit_stop(health=0.95)                  # fresh tires come via PITI / PITO, as in the game
+                game.start_scenario(lap_s=0.6, wear_per_lap=0.2, start_health=0.95, total_laps=30, lap=2)  # template: lap 2
                 out = await s.call("wait_for_trigger", {"timeout_s": 10})
                 trig = out["triggers"][0]
                 assert trig["type"] == "tires_wont_last", out
                 assert trig["reason"] == "prediction" and trig["predicted_health_end_of_next_lap"] <= 0.05
-                assert 0.1 <= trig["wear_per_lap"] <= 0.3
+                assert 0.1 <= trig["wear_per_lap"] <= 0.35, json.dumps(trig)   # max(measured, extrapolated)
                 assert trig["can_pit"] is True and trig["compound"] == "Wet"
                 # the engineer calls the stop; the tire screen opens
                 assert (await s.call("set_pit", {"pit": True}))["ok"]
@@ -350,24 +382,52 @@ def test_wait_for_trigger_card_damage_tires_timeout_and_session_end():
                 game.tire_event()
                 out = await s.call("wait_for_trigger", {"timeout_s": 5})
                 assert "tire_screen" in [t["type"] for t in out["triggers"]]
+                assert any(d["type"] == "tire_screen" for d in out["open_decisions"])
                 assert (await s.call("pick_tire", {"compound": "Standard"}))["ok"]
                 config = await s.call("get_trigger_config")
                 assert config["state"]["tires"]["stint_started_because"] == "pit exit"
                 listed = await s.call("get_triggers")
                 types = [t["type"] for t in listed["triggers"]]
                 assert types[:4] == ["card_offer", "car_damaged", "tires_wont_last", "tire_screen"]
-                # session end returns promptly
+                # session end returns promptly, as a queue entry
                 game.scenario = None
                 asyncio.get_running_loop().call_later(0.3, game.end_session)
                 t0 = time.monotonic()
-                out = await s.call("wait_for_trigger", {"timeout_s": 10})
+                out = await s.call("wait_for_trigger", {"timeout_s": 10, "since_seq": out["last_seq"]})
                 assert out["status"] == "session_ended" and time.monotonic() - t0 < 3
-                assert out["session_end"]["code"] == "SEND"
-                # a new session clears the queue
+                assert out["session_end"]["code"] == "SEND" and out["triggers"][-1]["type"] == "session_ended"
+                last = out["last_seq"]
+                # a new session keeps the old entries (marked stale) but never returns them again
                 game.new_session()
                 await asyncio.sleep(0.3)
                 listed = await s.call("get_triggers")
-                assert listed["triggers"] == []
+                assert listed["triggers"] and listed["acked_up_to_seq"] <= last
+                out = await s.call("wait_for_trigger", {"timeout_s": 0.5, "since_seq": last})
+                assert out["status"] == "timeout" and out["triggers"] == []
+    run(main())
+
+
+def test_pause_reported_not_stale():
+    """L3: while the game is paused only Session / Car Status / Participants arrive; that is a pause, not a fault."""
+    async def main():
+        with fake_game() as (game, port):
+            game.points = 0
+            async with mcp_server(port, game.command_port) as s:
+                await wait_receiving(s)
+                game.pause()
+                await asyncio.sleep(3.0)
+                status = await s.call("get_api_status")
+                tele = status["telemetry"]
+                assert tele["paused"] and tele["paused"]["paused"] is True, tele
+                assert "expected_not_arriving" not in tele
+                assert not any("have not arrived recently" in w for w in status.get("warnings", []))
+                out = await s.call("get_car_telemetry")
+                assert out["ok"] and out.get("paused") is True and "paused" in out["stale_note"]
+                assert "stopped" not in out["stale_note"]
+                game.resume()
+                await asyncio.sleep(0.5)
+                status = await s.call("get_api_status")
+                assert status["telemetry"]["paused"] is False
     run(main())
 
 
@@ -453,6 +513,36 @@ def test_bad_config_exits_with_message():
     proc = subprocess.run([sys.executable, "-m", "backseat_champions_mcp"], env=env, capture_output=True,
                           text=True, timeout=30, stdin=subprocess.DEVNULL)
     assert proc.returncode == 2 and "12 to 47" in proc.stderr and proc.stdout == ""
+    for bad in ("abc", "0", "-1", "nan", "inf"):           # V-D10: a clean config error, never a traceback
+        env = dict(os.environ, PYTHONPATH=SRC, BC_PROGRESS_INTERVAL_S=bad)
+        proc = subprocess.run([sys.executable, "-m", "backseat_champions_mcp"], env=env, capture_output=True,
+                              text=True, timeout=30, stdin=subprocess.DEVNULL)
+        assert proc.returncode == 2 and "BC_PROGRESS_INTERVAL_S" in proc.stderr, (bad, proc.stderr)
+        assert "Traceback" not in proc.stderr and proc.stdout == ""
+
+
+def test_no_unsolicited_notifications():
+    """V-D9: the server advertises neither logging nor resource subscriptions, so it sends neither
+    notifications/message nor notifications/resources/updated, however many triggers fire."""
+    async def main():
+        with fake_game() as (game, port):
+            async with mcp_server(port, game.command_port) as s:
+                caps = s.init.capabilities
+                assert caps.logging is None
+                assert caps.resources is None or not caps.resources.subscribe
+                await wait_receiving(s)
+                game.card_event()
+                out = await s.call("wait_for_trigger", {"timeout_s": 5})
+                assert out["triggered"] and out["triggers"][0]["type"] == "card_offer"
+                game.tire_event()
+                out = await s.call("wait_for_trigger", {"timeout_s": 5, "since_seq": out["last_seq"]})
+                assert any(t["type"] == "tire_screen" for t in out["triggers"])
+                await asyncio.sleep(0.5)
+                text = repr(s.messages)
+                assert "resources/updated" not in text and "ResourceUpdated" not in text, text
+                assert not any(isinstance(m, tuple) and m[0] == "log" for m in s.messages), text
+                assert "LoggingMessage" not in text and "notifications/message" not in text, text
+    run(main())
 
 
 # ------------------------------------------------------------------------------------------------ results
@@ -495,7 +585,11 @@ def test_results_receiver():
                 assert len(listed["results"]) == 1 and listed["results"][0]["game_version"] == "0.86.2"
                 out = await s.call("get_race_result", {"include_decisions": True})
                 session = out["sessions"][0]
-                assert session["classification"][0]["name"] == "Pole" and "steam_id" not in session["classification"][0]
+                assert listed["results"][0]["session_count"] is None or isinstance(listed["results"][0]["session_count"], int)
+                assert session["classification"][0]["name"] == "Pole"
+                assert "steam_id" not in session["classification"][0] and "host_steam_id" not in out   # R8
+                out = await s.call("get_race_result", {"include_steam_ids": True})
+                assert "steam_id" in out["sessions"][0]["classification"][0]
                 assert session["decisions_by_type"] == {"card/ml_agent": 1}
                 assert "state" not in session["decisions"][0]
                 out = await s.call("get_race_result", {"result_id": "../etc/passwd"})

@@ -8,6 +8,15 @@ public lobby rule, the seat rule and the command token. It does not simulate a r
 can mutate the player's car in the replayed packets: laps advancing at a fixed lap time (with LAPC / PITW events),
 tire health falling per lap, a puncture flag, a compound, the pit lane flag.
 
+Behaviour seen in the real game (0.88.2) that the server must cope with is modelled too:
+- pause() / resume(): session_time stops; only Session, Car Status (2 Hz) and Participants keep arriving.
+  auto_pause_on_hand pauses while points > 0 and a hand is on offer (the game pauses while a hand waits).
+- reorder(perm): the game re-orders car indices by race position mid-session: every per-car packet (Motion, Car
+  Telemetry, Lap Data, Car Status, Car Abilities, Participants) is permuted, seat_car[0] follows my car, and
+  positions are rewritten to index + 1. Participants still only comes every 5 s.
+- lapc_mode: "completed" (LAPC's lap = laps completed) or "lap_number" (= laps completed + 1); the README does
+  not say which.
+
 Manual use (then point the MCP server at the same ports, which are the game's defaults):
 
     python tests/fake_game.py                      # telemetry to 127.0.0.1:29770, commands on 127.0.0.1:29771
@@ -49,6 +58,9 @@ ABILITIES_CAR = 11
 TELEMETRY_CAR = 58                       # compound at +48, tire_flags +49, tire_health +50
 LAP_CAR = 18                             # lap uint16 at +2, flags at +4
 STATUS_CAR = 32
+PER_CAR = {"motion": 48, "car_telemetry": TELEMETRY_CAR, "lap_data": LAP_CAR, "car_status": STATUS_CAR,
+           "car_abilities": ABILITIES_CAR, "participants": 35}
+PAUSE_KEEPS = ("car_status", "session", "participants")     # still sent while the game is paused
 
 
 class FakeGame:
@@ -59,8 +71,14 @@ class FakeGame:
         self.token = token.encode("utf-8")
         self.session_uid = session_uid
         self.my_car = my_car
+        self.my_slot = my_car            # template slot of my car (reorder() moves its index)
+        self.perm = list(range(16))      # car index -> template slot
         self.frame = 0
         self.started = time.monotonic()
+        self.paused_at = None            # monotonic time the game paused (session_time frozen)
+        self.paused_total = 0.0
+        self.auto_pause_on_hand = False
+        self.lapc_mode = "completed"     # LAPC's lap: "completed" laps or the new "lap_number" (completed + 1)
         self.templates = {}
         for name in TELEMETRY + ["event"]:
             with open(os.path.join(DATA, name + ".bin"), "rb") as f:
@@ -136,7 +154,52 @@ class FakeGame:
         seats = (self.my_car, 255, 255, 255) if self.in_session else (255, 255, 255, 255)
         return HEADER.pack(1, packet_id, PACKET_VERSIONS.get(packet_id, 1), 0, 86, 2, 16 if self.in_session else 0,
                            self.session_uid if self.in_session else 0, self.frame,
-                           time.monotonic() - self.started, *seats)
+                           self.session_time(), *seats)
+
+    def session_time(self):
+        now = self.paused_at if self.paused_at is not None else time.monotonic()
+        return now - self.started - self.paused_total
+
+    def pause(self):
+        """The game pauses (it does while a card hand waits): session_time stops, rate packets stop."""
+        with self.lock:
+            if self.paused_at is None:
+                self.paused_at = time.monotonic()
+
+    def resume(self):
+        with self.lock:
+            if self.paused_at is not None:
+                self.paused_total += time.monotonic() - self.paused_at
+                self.paused_at = None
+
+    @property
+    def paused(self):
+        return self.paused_at is not None
+
+    def reorder(self, perm):
+        """Re-order car indices: new index i shows the car that was at index perm[i]. My car's index follows."""
+        assert sorted(perm) == list(range(16))
+        with self.lock:
+            self.perm = [self.perm[j] for j in perm]
+            self.my_car = self.perm.index(self.my_slot)
+
+    def truth(self, index):
+        """The template Participants entry (name, player_id) of the car at this index now."""
+        slot = self.perm[index]
+        raw = self.templates["participants"][HEADER.size + slot * 35:HEADER.size + (slot + 1) * 35]
+        return {"player_id": raw[0], "name": bytes(raw[3:35]).split(b"\0", 1)[0].decode("utf-8")}
+
+    def _permute(self, name, data):
+        size = PER_CAR.get(name)
+        if size is None or self.perm == list(range(16)):
+            return
+        src = bytes(data)
+        for i, slot in enumerate(self.perm):
+            a = HEADER.size + slot * size
+            data[HEADER.size + i * size:HEADER.size + (i + 1) * size] = src[a:a + size]
+        if name == "lap_data":
+            for i in range(16):
+                data[HEADER.size + i * LAP_CAR] = i + 1            # index = position - 1, as seen in 0.88.2
 
     def hand_bytes(self):
         raw = bytearray(17)
@@ -148,6 +211,7 @@ class FakeGame:
     def packet(self, name, car=None):
         data = bytearray(self.templates[name])
         pid = PACKET_IDS[name]
+        self._permute(name, data)
         data[:HEADER.size] = self.header(pid)
         self.advance_scenario()
         if name == "player":
@@ -202,7 +266,7 @@ class FakeGame:
             self.total_laps, self.lap = total_laps, lap
             self.tire_health = start_health
             self.scenario = {"lap_s": lap_s, "wear": wear_per_lap, "health0": start_health,
-                             "t0": time.monotonic(), "lap0": lap}
+                             "t0": self.session_time(), "lap0": lap}
 
     def advance_scenario(self):
         sc = self.scenario
@@ -210,7 +274,7 @@ class FakeGame:
             return
         fire = None
         with self.lock:
-            elapsed = time.monotonic() - sc["t0"]
+            elapsed = self.session_time() - sc["t0"]
             lap = sc["lap0"] + int(elapsed / sc["lap_s"])
             if not self.in_pits:
                 self.tire_health = max(0.0, sc["health0"] - sc["wear"] * elapsed / sc["lap_s"])
@@ -218,7 +282,7 @@ class FakeGame:
                 self.lap = lap
                 fire = lap
         if fire is not None:
-            self.lap_event(fire, 11)
+            self.lap_event(fire if self.lapc_mode == "completed" else fire + 1, self.my_car + 1)
             self.pit_window_event(fire)
 
     def pit_stop(self, compound=None, health=1.0):
@@ -228,7 +292,7 @@ class FakeGame:
         with self.lock:
             if self.scenario is not None:
                 self.scenario["health0"] = health
-                self.scenario["t0"] = time.monotonic() - (self.lap - self.scenario["lap0"]) * self.scenario["lap_s"]
+                self.scenario["t0"] = self.session_time() - (self.lap - self.scenario["lap0"]) * self.scenario["lap_s"]
                 self.scenario["lap0"] = self.lap
             self.tire_health = health
             if compound is not None:
@@ -265,11 +329,18 @@ class FakeGame:
         last = {}
         period = 1.0 / self.rate_hz
         while self.running:
+            if self.auto_pause_on_hand:
+                if self.points > 0 and self.hand:
+                    self.pause()
+                elif self.paused:
+                    self.resume()
             if self.in_session and self.sending:
                 now = time.monotonic()
                 self.frame += 1
                 for name in TELEMETRY:
                     if not self.wanted(name):
+                        continue
+                    if self.paused and name not in PAUSE_KEEPS:
                         continue
                     if name in SLOW and now - last.get(name, -1e9) < SLOW[name]:
                         continue
@@ -292,8 +363,16 @@ class FakeGame:
         self.send_event("CARD", 0, bytes([self.points]) + self.hand_bytes())
 
     def tire_event(self, pre_race=False, current=5, picks_left=(255, 2, 2, 2, 2, 255, 2)):
+        """The tire selection screen opens (a TIRE event); pick_tire works until close_tire_screen() / a pick."""
         self.tire_screen = True
         self.send_event("TIRE", 0, bytes([1 if pre_race else 0, current, self.allowed_compounds]) + bytes(picks_left))
+
+    def close_tire_screen(self, leave_pits=True):
+        """The tire screen closes without a pick (the car drives out of the pit lane: PITO)."""
+        self.tire_screen = False
+        if leave_pits:
+            self.in_pits = False
+            self.send_event("PITO", 0)
 
     def pit_window_event(self, lap=3):
         self.send_event("PITW", 0, struct.pack("<HBB", lap, 1 if self.pit_planned else 0, 1 if self.can_pit else 0))
@@ -308,6 +387,10 @@ class FakeGame:
 
     def end_session(self):
         self.send_event("SEND", 255)
+
+    def finish_event(self, position=11):
+        """FINI: player one took the flag."""
+        self.send_event("FINI", 0, bytes([position]))
 
     # ---------------------------------------------------------------- commands
 

@@ -1,9 +1,10 @@
 """Static reference data: what each error reason, event code, packet, command and settings switch means.
 
-Everything here restates the game's ``GameAPI/README.md``. Where the README gives only a name (for instance the
-error ``replay_playing``), the text says so instead of guessing. The MCP server serves these tables through the
-``get_reference`` tool and the ``bc://reference/{topic}`` resources, and uses ``ERROR_INFO`` to explain refused
-commands.
+The explanations restate the game's ``GameAPI/README.md``. Where the README gives only a name (for instance the
+error ``replay_playing``), the text says so; anything beyond the README is marked "(inferred ...)", and behaviour
+seen against the live game is marked "observed in game 0.88.2" (see ``OBSERVED``). Hints are this server's advice
+on what to do next. The MCP server serves these tables through the ``get_reference`` tool and the
+``bc://reference/{topic}`` resources, and uses ``ERROR_INFO`` / ``LOCAL_ERROR_INFO`` to explain failures.
 """
 from . import protocol as P
 
@@ -56,6 +57,9 @@ INPUT_SWITCHES = {
         "tools": ["drive", "release_drive"],
     },
 }
+
+# Switches the race-engineer loop (wait_for_trigger and the decision commands) relies on; the others are optional.
+REQUIRED_SWITCHES = ("driver_data", "player_data", "decision_events", "player_input")
 
 # Which broadcast switches (any one of them) a telemetry packet needs.
 PACKET_SWITCHES = {
@@ -151,15 +155,17 @@ _PLAYER_INPUT_HINT = ("Switch on Player Input in the game (%s, Input). get_api_s
 # reason -> (explanation, hint). Explanations restate the README; hints say what to do next with these tools.
 ERROR_INFO = {
     "invalid_packet": (
-        "The game found the command too short, or the wrong size for its command id.",
-        "This points at a version mismatch between the game and this server. Compare get_api_status "
-        "(game_version) with the version this server was written for."),
+        "The game found the command too short, or the wrong size for its command id. (README: \"too short, or the "
+        "wrong size for its command; from another machine only answered when it carries the token\".)",
+        "Every command this server sends has the size the README gives, so a version mismatch between the game and "
+        "this server is the likely cause: compare get_api_status (game_version). For a game on another machine "
+        "this reply also proves the Command Token was right (without it the game would not answer at all)."),
     "unsupported_version": (
         "The game does not speak this packet_format or command_version.",
         "The game's API version differs from the one this server implements (packet format 1, command version 1). "
         "Update the server or the game."),
     "unknown_command": (
-        "The game does not know this command id.",
+        "The game does not know this command id (inferred from the name; the README gives only the name).",
         "The game is probably older than the API this server implements. Check get_api_status (game_version)."),
     "public_lobby": (
         "All input is off in a public lobby: every command except ping, hello and set_camera is refused, and a car "
@@ -178,21 +184,27 @@ ERROR_INFO = {
         "There is no session, or no player in seat 0.",
         "Wait until a session is running (an SSTA event, or get_session returning data) and retry."),
     "replay_playing": (
-        "The game refused the command with reason replay_playing.",
-        "The API documentation gives only the name of this reason. Retry once the replay is over."),
+        "The game refused the command with reason replay_playing (the README gives only the name; presumably a "
+        "replay is playing - inferred).",
+        "The API documentation gives only the name of this reason. Retry once the replay is over (inferred from "
+        "the name)."),
     "no_points": (
-        "There are no upgrade points to spend.",
-        "Wait for the next CARD event (wait_for_event) or check points in get_player_state."),
+        "There are no upgrade points to spend (inferred from the name; the README gives only the name).",
+        "Wait for the next card_offer trigger (wait_for_trigger) or check points in get_player_state. The hand is "
+        "treated as answered."),
     "invalid_index": (
-        "The index is not a card in the current hand.",
+        "The index is not a card in the current hand (inferred from the name; the README gives only the name).",
         "Read the current hand with get_pending_decisions or get_player_state; valid indices are 0 to "
         "(number of cards - 1)."),
     "cards_unavailable": (
-        "The game refused the command with reason cards_unavailable.",
-        "The API documentation gives only the name of this reason. Check get_pending_decisions for a hand on "
-        "offer, or wait for the next CARD event."),
+        "The game refused the command with reason cards_unavailable (the README gives only the name; presumably no "
+        "hand can be picked from right now - inferred).",
+        "The API documentation gives only the name of this reason. Observed in game 0.88.2 for a hand offered "
+        "while the car was in the pit lane; the same pick succeeded seconds later. The hand stays open: pick_tire "
+        "first if the tire screen is open, or retry after the car leaves the pit lane (PITO). Otherwise check "
+        "get_pending_decisions for a hand on offer."),
     "card_banned": (
-        "That card is banned and cannot be picked.",
+        "That card is banned and cannot be picked (inferred from the name; the README gives only the name).",
         "Pick a card whose banned flag is false (get_pending_decisions shows the hand)."),
     "driver_decided": (
         "Reserved error reason; the API documentation says it is never sent.",
@@ -201,12 +213,13 @@ ERROR_INFO = {
         "The game would not make the pit call.",
         "Check can_call_now in get_player_state (or can_pit in the latest PITW event) before calling set_pit."),
     "invalid_compound": (
-        "That is not a tire compound the game knows.",
+        "That is not a tire compound the game knows (inferred from the name; the README gives only the name).",
         "Use one of the names in get_reference(topic='compounds')."),
     "tire_select_closed": (
-        "The tire screen is not open, so no compound can be picked.",
-        "pick_tire only works while the tire screen is open (starting grid, qualifying box or pit stop). Wait for "
-        "a TIRE event (wait_for_event with codes=['TIRE'])."),
+        "The tire screen is not open, so no compound can be picked (inferred from the name; the README gives only "
+        "the name).",
+        "pick_tire only works while the tire screen is open (starting grid, qualifying box or pit stop). It is "
+        "announced by the tire_screen trigger of wait_for_trigger (TIRE event); get_pending_decisions shows it."),
     "compound_refused": (
         "That compound can't be picked now.",
         "Choose one of the allowed compounds of the latest TIRE event (get_pending_decisions) with picks left."),
@@ -218,7 +231,8 @@ ERROR_INFO = {
         "pedal or steer is not a finite number.",
         "Send finite values between -1 and 1."),
     "internal_error": (
-        "The game reported an internal error while handling the command.",
+        "The game reported an internal error while handling the command (inferred from the name; the README gives "
+        "only the name).",
         "Retry once; if it persists, check the game's log."),
     "ban_refused": (
         "The ban was refused: no ban tokens left, the card is the last one left to pick, or it can't be banned.",
@@ -239,7 +253,10 @@ LOCAL_ERROR_INFO = {
         "The game did not answer.",
         "Possible causes: the game is not running; the Game API is switched off (%s); the game listens on a "
         "different address or port than this server sends to; or, when the game runs on another machine, the "
-        "Command Token is missing or wrong (the game then drops commands without answering)." % SETTINGS_PATH),
+        "Command Token is missing or wrong (the game then drops commands without answering). For boost / drive: "
+        "under an extreme flood of replies the liveness ping can time out although the hold started; check "
+        "get_car_abilities (api_boosting) or get_api_status (holds), or call stop_boost / release_drive."
+        % SETTINGS_PATH),
     "game_unreachable": (
         "The operating system reports that nothing is listening on the game's command port.",
         "Start the game and switch on the Game API (%s), or correct BC_COMMAND_HOST / BC_COMMAND_PORT."
@@ -247,12 +264,73 @@ LOCAL_ERROR_INFO = {
     "send_failed": (
         "The command could not be sent.",
         "Check BC_COMMAND_HOST / BC_COMMAND_PORT and the network."),
+    "protocol_error": (
+        "The game answered with a reply of the wrong kind (or for another command) for this request id.",
+        "The reply was not credited. Retry once; if it persists, the game speaks a different API version than this "
+        "server, or something else answers on the command port: check get_api_status and BC_COMMAND_PORT."),
+    "server_error": (
+        "This server failed while handling the call (a bug, or a stored file it could not read).",
+        "Retry once; if it persists, check the server's log (stderr)."),
+    "stored_file_unreadable": (
+        "The stored race results upload could not be read or parsed.",
+        "Pick another upload from list_race_results; the file may be damaged."),
+    "unsupported_format": (
+        "The stored race results document has a format this server does not read (it reads format 2).",
+        "Update this server. The raw upload is kept in BC_RESULTS_DIR."),
     "bad_argument": (
         "The argument is not valid for this command.",
         "See the tool description for the allowed values."),
+    "hand_changed": (
+        "The hand on offer is no longer the hand of the card_offer trigger whose seq was passed, so the index may "
+        "name another card. Nothing was sent to the game.",
+        "Pick from the current hand returned with this error (or from get_pending_decisions), passing the seq of "
+        "the newest card_offer, or omit seq."),
+    "no_data": (
+        "No packet of the needed type has been received.",
+        "Check get_api_status: the game must be running with the Game API on and the needed switch ticked (%s), "
+        "and a session must be running." % SETTINGS_PATH),
+    "switch_off": (
+        "The game is running, but the switch this data needs is off.",
+        "Tick the named switch under %s, then retry." % SETTINGS_PATH),
+    "not_in_session": (
+        "No telemetry is arriving: the game sends none outside a session.",
+        "Start or join a session in the game (the API cannot start one), then retry. If a session is running, "
+        "check the telemetry targets under %s and that no other program receives on this server's port."
+        % SETTINGS_PATH),
+    "telemetry_listener_down": (
+        "This server could not open its telemetry socket, so it receives no race data.",
+        "Another program (often a second copy of this server started by another MCP client) holds the port. Close "
+        "it (the server retries every 2 s), or add a second telemetry target with its own port in the game (%s) "
+        "and set BC_TELEMETRY_PORT. Commands and get_api_status still work." % SETTINGS_PATH),
+    "replaced": (
+        "Another boost / drive call, or a stop, replaced this hold before it started.",
+        "Check get_api_status (holds)."),
     "drive_disabled": (
         "Driving is disabled in this server.",
         "The server operator must start it with BC_ALLOW_DRIVE=1 (or --allow-drive)."),
+}
+
+
+# Appended to the hint of a no_reply for a command that changes game state (pick_card, ban_card, set_pit,
+# pick_tire): the result then also carries outcome_unknown: true.
+OUTCOME_UNKNOWN_HINT = (
+    "No reply, so the outcome is unknown: the game may have applied the command and only the reply was lost. Check "
+    "get_pending_decisions / get_player_state before retrying.")
+
+# Behaviour seen against the live game that the README does not state (or contradicts). Observations, not spec.
+OBSERVED = {
+    "game_version": "0.88.2 (one race, Turkey, 10 laps)",
+    "pause_during_hand": "The game pauses while a card hand waits for the player: only Session and Car Status "
+                         "(twice a second) and Participants keep arriving, the configured-rate packets stop and "
+                         "session_time does not advance. Answer card_offer at once.",
+    "car_indices_reorder": "Car indices re-order by race position mid-session (the README says an index stays the "
+                           "same for the whole session): Participants and header.seat_car follow, and the player's "
+                           "index was always position - 1. player_id stays the same; this server resolves 'me' from "
+                           "each packet's own seat_car[0] and offers car='ahead' / 'behind'.",
+    "cards_unavailable_in_pits": "pick_card was refused with cards_unavailable for a hand offered while the car was "
+                                 "in the pit lane; the same pick succeeded seconds later.",
+    "client_call_limit": "The Claude desktop app's remote-device bridge cut a tool call at about 80 s regardless of "
+                         "progress notifications, and the call's result was lost: waits are capped at 55 s.",
 }
 
 
@@ -309,13 +387,18 @@ def _topic_settings():
 
 def _topic_triggers():
     return {
-        "model": "The server never acts on its own. wait_for_trigger blocks until a trigger fires; everything else is "
-                 "queried on demand. Thresholds are this server's tunable heuristics, not game values.",
+        "model": "The server never sends a gameplay command on its own (only the read-only hello). "
+                 "wait_for_trigger blocks until a decision is needed; everything else is queried on demand. "
+                 "Thresholds are this server's tunable heuristics, not game values.",
         "triggers": [
-            {"type": "card_offer", "fires_on": "a new hand for seat 0: CARD event; Player packet when Decision Events "
-                                               "is off, or when no CARD event announced a hand within 2 s",
+            {"type": "card_offer", "fires_on": "a new hand for seat 0: CARD event; or the Player packet (points > 0, "
+                                               "a new hand stable for 0.25 s) when Decision Events is off, and also "
+                                               "with Decision Events on when no CARD event announced that hand "
+                                               "within 2 s. One hand fires once, whichever source sees it first",
              "needs": "Decision Events or Player Data", "heuristic": False},
-            {"type": "car_damaged", "fires_on": "puncture flag 0 -> 1 (definite); or a sudden drop of one performance "
+            {"type": "car_damaged", "fires_on": "puncture flag set in two consecutive sampled packets of the same source (Player, or "
+                                                "Car Telemetry without Player Data; definite; re-arms after 3 s of "
+                                                "session time clear or a pit exit); or a sudden drop of one performance "
                                                 "area of your car not shared by the field and not during an ability "
                                                 "(heuristic, BC_TRIGGER_PERF_DROP / BC_TRIGGER_PERF_WINDOW_S)",
              "needs": "Player Data or Driver Data (puncture); Driver Data (performance)", "heuristic": "partly"},
@@ -324,10 +407,41 @@ def _topic_triggers():
                                                     "lap, in the pit lane, after the flag, or with a stop called",
              "needs": "Player Data or Driver Data; Driver Data (Lap Data) or Decision Events (LAPC) to count laps",
              "heuristic": True},
-            {"type": "tire_screen", "fires_on": "TIRE event for seat 0 (off by default; BC_TRIGGERS)",
+            {"type": "tire_screen", "fires_on": "TIRE event for seat 0 (on by default; BC_TRIGGERS)",
              "needs": "Decision Events", "heuristic": False},
+            {"type": "session_ended", "fires_on": "SEND or FINI for seat 0, whichever comes first, once per "
+                                                  "session; also queued for the old session when a new one starts "
+                                                  "without either", "needs": "Decision Events", "heuristic": False},
         ],
-        "session_ended": "SEND, or FINI for seat 0: wait_for_trigger returns status session_ended once.",
+        "delivery": [
+            "Every trigger gets an increasing seq and stays in a bounded queue (also across sessions).",
+            "wait_for_trigger(timeout_s<=55, since_seq=last_seq of the previous result) acknowledges everything up "
+            "to since_seq and returns at once if anything is due, else blocks until something is due or the "
+            "timeout. A wait never lasts more than 55 s by default (BC_WAIT_MAX_S can lower it; hard cap 60).",
+            "Due: not yet returned, or returned at least 20 s ago and not acknowledged, at most 3 resends for an "
+            "open decision (card_offer, tire_screen) and 1 for other types when since_seq is passed (none "
+            "without since_seq). Resent entries carry resent: true. (The 20 s is BC_REMIND_S, an advanced "
+            "knob meant for tests; default 20, must be > 0.)",
+            "Superseded entries (a newer hand or tire screen, new tires since), decisions known to be closed and "
+            "entries of an old session (except its session_ended) are not returned; skipped counts them.",
+            "Every result, timeouts included, carries last_seq (pass it as since_seq next time) and open_decisions "
+            "(the live open card hand / tire screen); open_decisions never causes an early return.",
+            "After a lost result (a client cut the call) an entry is not returned again at once: it comes back on "
+            "a later wait once 20 s have passed since it was last returned. The 55 s cap is the primary "
+            "protection against clients that cut calls at about 80 s; resends are the fallback, and in that rare "
+            "case the game can stay paused on a card hand for up to about 20 s.",
+            "The first call of a server process ignores since_seq, and a since_seq above the newest seq resets "
+            "the acknowledgement (server restarted).",
+        ],
+        "statuses": ["triggered", "session_ended", "timeout"],
+        "limitations": [
+            "A telemetry packet with a new, never-seen session_uid starts a new session; on loopback (no source "
+            "filtering) any local process could spoof that.",
+            "Last-lap silence and laps_remaining need Lap Data (Driver Data) or Player Data; with neither there is "
+            "no lap count and tires_wont_last can fire on the last lap.",
+        ],
+        "tires_wont_last_floor": "BC_TIRE_FLOOR applies only when there is no forecast yet; with a forecast only "
+                                 "predicted health <= BC_TIRE_MARGIN fires.",
     }
 
 
@@ -341,11 +455,17 @@ def _topic_rules():
                       "applies: a refused compound, a banned card or a pit call the car can't make comes back as an "
                       "error.",
         "holds": "drive and boost act only while commands keep arriving; after 0.25 s without one the game lets "
-                 "go. This server re-sends them at 50 Hz for the duration you ask for.",
+                 "go. This server re-sends them at 50 Hz for the duration you ask for (duration_s 0.05 to 30 s for "
+                 "boost, 0.05 to 10 s for drive).",
         "drive": "Achievements, Steam stats and leaderboard submissions are withheld for any race weekend in which "
                  "drive steered a car; a race that follows qualifying on the same track is the same weekend.",
         "not_switchable": "DRS, slipstream and boost overspeed are applied by the game on its own; the API only "
                           "reports them.",
+        "boost_withholding": "The README says boost does not count as driver input; that boosting therefore "
+                             "does not withhold achievements is inferred (the README states the withholding "
+                             "only for drive).",
+        "car_index": "README: a car's index stays the same for the whole session. Observed in game 0.88.2: indices "
+                     "re-order by race position mid-session; use car='me' / 'ahead' / 'behind' and player_id.",
         "versioning": "Enum values never change meaning; new ones are added at the end. A value this server does "
                       "not know is shown as unknown_<number>.",
     }
@@ -374,8 +494,10 @@ _TOPICS = {
                  _topic_commands),
     "settings": ("The in-game switches and which tools depend on them.", _topic_settings),
     "rules": ("Rules that apply to every command.", _topic_rules),
-    "triggers": ("This server's triggers: what fires them, which switches they need, which are heuristic.",
-                 _topic_triggers),
+    "triggers": ("This server's triggers: what fires them, which switches they need, which are heuristic, "
+                 "and how wait_for_trigger delivers them.", _topic_triggers),
+    "observed": ("Behaviour seen against the live game (0.88.2) that the README does not state or contradicts.",
+                 lambda: dict(OBSERVED)),
 }
 
 TOPICS = tuple(_TOPICS)

@@ -8,10 +8,11 @@ Conventions in this document:
 
 - **[README]** = stated in the spec. **[code]** = only visible in `bc_api.py` / `gameapi_client.py` / `lib.rs`.
   **[capture]** = observed in `testdata/`. **[inferred]** = my reading, not stated anywhere; treat as unverified.
-- "Unclear" means the sources do not say. Nothing here was tested against a running game.
+- "Unclear" means the sources do not say. **[observed 0.88.2]** = seen in one race against the live game (0.88.2);
+  an observation, not a documented guarantee. Everything else was not tested against a running game.
 
 Known discrepancies between the sources are collected in [section 10](#10-discrepancies-and-open-questions). The most
-important one: **AI Observations is 1,432 bytes, not the 1,428 the README table says.**
+important one: **AI Observations is 1,432 bytes, not the 1,428 the README table says** (confirmed live in 0.88.2).
 
 ---
 
@@ -169,8 +170,12 @@ Python struct: `<HBB3BBIIf4B`
 | 16 | `session_time` | float | seconds since the session's cars were placed on the grid |
 | 20 | `seat_car` | uint8[4] | car index of each local player; seat 0 is player one; 255 = no such player |
 
-A car's **index** is its position in the session's participant list, from 0, fixed for the session. Every per-car
-array has 16 slots; slots from `num_cars` on are zero. Both decoders return only the first `num_cars` entries.
+A car's **index** is its position in the session's participant list, from 0. [README] says it stays the same for
+the whole session. **[observed 0.88.2]** It does not: mid-race the participant list and `seat_car` were re-ordered
+by race position (the player's index went 3, 4, 6, 8, 9, 11, always position - 1), while `player_id` stayed the same.
+Within one packet the indices agree with that packet's own `seat_car`; do not carry an index from one packet to a
+later one. Every per-car array has 16 slots; slots from `num_cars` on are zero. Both decoders return only the first
+`num_cars` entries.
 
 To find "my car" in any per-car packet: `cars[header.seat_car[0]]`, after checking it is not 255 and is below the
 array length.
@@ -550,6 +555,9 @@ compound, a banned card or a pit call the car can't make comes back as an error.
 
 ### 4.4 Per-command detail
 
+[inferred] This section is my reading of the README per command. Error lists, prerequisites and side effects are
+inferred unless marked [README], [capture] or [observed 0.88.2]; the README has no per-command error matrix.
+
 #### 0 `ping`
 
 - Payload: none. 56 bytes.
@@ -576,7 +584,8 @@ compound, a banned card or a pit call the car can't make comes back as an error.
   - `no_points` (9): no upgrade points to spend.
   - `invalid_index` (10): index outside the hand. [capture: `pick_card` with a bad index returned this; `validate`
     sends index 99 and expects an Error.]
-  - `cards_unavailable` (11): no hand on offer right now.
+  - `cards_unavailable` (11): no hand on offer right now [inferred]. **[observed 0.88.2]** also returned for a hand
+    offered while the car was in the pit lane; the same pick succeeded seconds later.
   - `card_banned` (12): [README] "a banned card ... comes back as an error".
   - `driver_decided` (13): reserved, never sent.
 - Side effects: spends one upgrade point and applies the card's upgrade. A pick ends the turn for that hand
@@ -649,8 +658,9 @@ compound, a banned card or a pit call the car can't make comes back as an error.
 #### 8 `boost`
 
 - Payload: `seat` (0), `buttons` bitmask: bit 0 (1) speed boost, bit 1 (2) cornering boost, bit 2 (4) party mode.
-- Prerequisites: Player Input. Does **not** need Driver Input and "does not count as driver input", so it does not
-  trigger the achievement/leaderboard withholding.
+- Prerequisites: Player Input. Does **not** need Driver Input. [README] "does not count as driver input".
+  [inferred] It therefore does not trigger the achievement/leaderboard withholding, which the README states only
+  for `drive`.
 - Reply: **only on error**.
 - Specific errors: `assist_on` (22): [README] a Boost Assist (or Party Mode Assist) that is switched on boosts for
   the player and keeps those buttons.
@@ -1033,8 +1043,8 @@ Useful as a model for an MCP-side results receiver.
 
 ## 8. Decoded testdata
 
-Produced by `python3 -I /home/claude/bc_mcp/scratch/decode_testdata.py` (and `mycar.py`), loading `bc_api.py` by
-path. Floats rounded to 4 places; long arrays truncated. Output is in bc_api's dict form, not raw wire values.
+Decoded with the game's `bc_api.py` (the same decoding the tests cross-check when `BC_UPSTREAM_GAMEAPI` is set).
+Floats rounded to 4 places; long arrays truncated. Output is in bc_api's dict form, not raw wire values.
 
 Three different sessions appear in the captures: most packets are from `session_uid` 383067569 (player on car 10),
 the event from 640902445 (player on car 14), and the three replies from 1663966214 (player on car 13).
@@ -1223,58 +1233,18 @@ All 20 points in use. The first point is about 4.5 m from the car's Motion posit
 
 ---
 
-## 9. Proposed MCP tool surface
+## 9. MCP tool surface
 
-Architecture notes [design suggestions, not from the sources]:
+The tools this server registers, with their parameters, are listed in [TOOLS.md](TOOLS.md) (generated from the
+server, so always current). The design notes that shaped them:
 
-- Run one background UDP listener on the telemetry port that keeps the **latest packet per type** (per seat for
-  Player / Racing Line, per car for AI Observations) plus a bounded **event queue**. Tools read from this cache.
-- Use one connected command socket; allocate an incrementing `request_id`; match replies on `request_id`.
-- `drive` and `boost` cannot be single-shot tools: they need a background task re-sending at up to 50 Hz for a
-  bounded duration, ending with `release_drive` / `boost(0)`.
-- Every write tool should hard-code `seat = 0`.
-- Return bc_api-style decoded dicts (enum names, expanded flags).
-- Surface "no data" distinctly from "zero": no telemetry arrives outside a session or when the switch is off.
-
-### Read tools (no game state change)
-
-| Tool | Uses | Returns |
-|---|---|---|
-| `get_api_status` | command `hello` (1), `ping` (0) | game version, input switches, broadcast switches, rate, public-lobby flag, schema version/hash; "no reply" diagnosis |
-| `get_session` | Session (5) + header | session type, laps, fuel/boost mode, weather, scene, track properties, api flags, `session_uid`, `session_time` |
-| `get_participants` | Participants (6) | car index, name, car type, kind |
-| `get_standings` | Lap Data (2) + Participants (6) | ordered table: position, name, lap, gaps, pit stops, in-pits / finished flags |
-| `get_my_car` | header `seat_car[0]`, Car Telemetry (1), Lap Data (2), Car Abilities (12), Car Status (3) | speed, pedal/steer, tire compound and health, energy, position, gaps, ability flags, performance ratios |
-| `get_player_state` | Player (4) | points, hand, laps remaining, pit flags, tire state, `compound_picks_left`, energy, strategy scalars (without the opaque vectors by default) |
-| `get_hand` | Player (4) `hand` + `points`, Car Abilities (12) `ban_tokens` | cards with index, upgrade, facility, tier, banned; points; ban tokens |
-| `get_car` (by index) | Motion (0), Car Telemetry (1), Lap Data (2), Car Status (3), Car Abilities (12) | any car's public state |
-| `get_car_abilities` | Car Abilities (12) | who is boosting, DRS, slipstream, recharge; own unlocks |
-| `get_racing_line` | Racing Line (13) | up to 20 upcoming checkpoints with line and both edges |
-| `get_motion` | Motion (0) | positions, velocities, attitude for all cars or one |
-| `get_strategy_features` | Player (4) `opponents`, `near`; Session schema hash | opaque Extreme AI vectors, labelled with schema version/hash |
-| `get_ai_observations` | AI Observations (8) | per-car policy id, action, obs vector (opaque); host only, switch off by default |
-| `poll_events` / `wait_for_event` | Event (7) | queued events since last call, optionally filtered by code, with timeout |
-| `get_pending_decisions` | Event (7) `CARD`/`TIRE`/`PITW` + Player (4) | what currently needs an answer: unspent points and hand, open tire screen with allowed compounds, pit window |
-| `get_enums` | static tables | all enum tables from section 5 |
-| `get_race_results` (optional) | HTTP results upload receiver | last uploaded weekend(s): classification, decisions |
-
-### Write tools (change game state)
-
-| Tool | Uses | Notes for the tool description |
-|---|---|---|
-| `pick_card(index)` | command 2 | needs Player Input and points; index from the current hand; spends a point; errors `no_points`, `invalid_index`, `cards_unavailable`, `card_banned` |
-| `ban_card(index)` | command 7 | spends a ban token; keeps the turn (a pick is still due); `ban_refused` when no tokens, last pickable card, or unbannable |
-| `set_pit(pit: bool)` | command 3 | call or cancel a stop; check `can_pit`; `refused` when the car cannot make the call |
-| `pick_tire(compound)` | command 4 | only while the tire screen is open (after a `TIRE` event); must be in `allowed`; errors `tire_select_closed`, `compound_refused`, `invalid_compound` |
-| `boost(speed, cornering, party_mode, duration_s)` | command 8, repeated at the physics rate, then `boost(0)` | speed + cornering = super boost once unlocked; party mode only in fuel races once unlocked; `assist_on` if an assist owns the buttons; replies only on error; verify via Car Abilities |
-| `stop_boost` | command 8 with buttons 0 | releases at once |
-| `set_camera(camera)` | command 9 | name, index, or next / previous / automatic; TrackOverview refused; works in public lobbies |
-| `drive(pedal, steer, duration_s)` | command 5, repeated at 50 Hz | needs Driver Input and local simulation; **withholds achievements, Steam stats and leaderboards for the whole race weekend**; should require explicit opt-in; replies only on error (`not_host`, `invalid_axis`) |
-| `release_drive` | command 6 | hands the car back immediately |
-| `ping` | command 0 | liveness; could be folded into `get_api_status` |
-
-Composite tools worth considering: `spend_all_points(policy)` (loop `pick_card` until `no_points`), and
-`answer_tire_select(compound)` that waits for `TIRE` then picks.
+- One background UDP listener keeps the latest packet per type (per seat for Player / Racing Line, per car for AI
+  Observations) plus a bounded event queue; tools read from this cache.
+- One command socket with incrementing `request_id`s; replies are matched on `request_id` and command.
+- `drive` and `boost` hold at 50 Hz for a bounded duration in a background task (`duration_s` 0.05 to 10 s for
+  `drive`, 0.05 to 30 s for `boost`).
+- Every write tool hard-codes `seat = 0`.
+- "No data" is reported distinctly from "zero": no telemetry arrives outside a session or when a switch is off.
 
 ---
 
@@ -1282,7 +1252,8 @@ Composite tools worth considering: `spend_all_points(policy)` (loop `pick_card` 
 
 1. **AI Observations size.** README packet table and Bandwidth section say 1,428 bytes. The README's own field list
    sums to 1,408 + 24 = **1,432**, which is what `bc_api.py`, `lib.rs` and `testdata/ai_observations.bin` use.
-   Use 1,432.
+   Use 1,432. **Confirmed live** against game 0.88.2: 250,584 AI Observations packets of exactly 1,432 bytes in one
+   race, none dropped.
 2. **`interval_behind` sign.** Documented only as "seconds"; negative for every car in the capture.
 3. **Gap mismatch.** In the same frame Lap Data gives the player's `gap_to_leader` as 4.8655 while Player gives
    `class_gap_to_leader` as 4.8172 (single class, so same leader). They are evidently computed differently or at
@@ -1314,3 +1285,8 @@ Composite tools worth considering: `spend_all_points(policy)` (loop `pick_card` 
     while points remain.
 16. **`game-api.json`** layout is not documented.
 17. **No `Cargo.toml`** in this copy of `rust/`.
+18. **Index stability** [observed 0.88.2]. The README says an index stays the same for the session; live, indices
+    re-ordered by race position (section 2.0).
+19. **Pause during a card hand** [observed 0.88.2]. The game pauses while a hand waits: only Session, Car Status and
+    Participants keep arriving and `session_time` stops. Not mentioned in the README.
+20. **`LAPC.lap`**: whether it is the lap just completed or the new lap number is not stated.

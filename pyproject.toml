@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "backseat-champions-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Unofficial MCP server for the Backseat Champions Game API: an LLM as race engineer, woken by triggers."
 readme = "README.md"
 requires-python = ">=3.10"

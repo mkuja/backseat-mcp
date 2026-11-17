@@ -1,8 +1,11 @@
 """MCP server for the Backseat Champions Game API (unofficial).
 
-The model acts as race engineer. The server is trigger-driven: ``wait_for_trigger`` blocks until one of three
-conditions needs a decision (a new card hand is offered, the car is damaged, the tires will not last another lap);
-everything else is available through on-demand query tools. The server never sends a command on its own.
+The model acts as race engineer. The server is trigger-driven: ``wait_for_trigger`` blocks (at most 60 s) until
+something needs a decision (a new card hand, the tire screen, damage, tires that will not last another lap) and
+keeps returning an unanswered decision until it is acknowledged with ``since_seq`` or answered; everything else is
+available through on-demand query tools. The server never sends a gameplay command on its own; the only command it
+sends unasked is the read-only ``hello`` handshake (at start, on a new session at most once a second, and from read
+tools when data is missing, to say why).
 
 Run ``backseat-champions-mcp --help`` for options. Logs go to stderr; stdout carries only MCP messages.
 """
@@ -10,16 +13,19 @@ import argparse
 import asyncio
 import contextlib
 import functools
+import inspect
 import json
 import logging
 import math
 import os
+import re
+import statistics
 import sys
 import time
 import warnings
 from typing import Annotated, Any, List, Optional, Union
 
-from pydantic import Field
+from pydantic import Field, Strict
 
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
@@ -27,51 +33,66 @@ from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from . import __version__
 from . import protocol as P
 from . import reference as R
-from .client import MAX_BOOST_S, MAX_DRIVE_S, Config, GameClient, failure
-from .results import ResultsReceiver
+from .client import MAX_BOOST_S, MAX_DRIVE_S, MIN_HOLD_S, Config, GameClient, failure
+from .instructions import INSTRUCTIONS, race_engineer_prompt
+from .results import ResultsError, ResultsReceiver
 
 log = logging.getLogger("backseat_champions_mcp")
 
+# Strict scalar types for tool arguments: true is not 1, "yes" is not true, and 1 is still a valid float.
+SInt = Annotated[int, Strict()]
+SStr = Annotated[str, Strict()]
+SFloat = Annotated[float, Strict()]
+
 TRIGGERS_URI = "bc://triggers/latest"
 WAIT_EVENT_MAX_S = 60.0
-PROGRESS_INTERVAL_S = float(os.environ.get("BC_PROGRESS_INTERVAL_S") or 10.0)
+WAIT_HARD_MAX_S = 60.0       # wait_for_trigger never blocks longer (X3); BC_WAIT_MAX_S can only lower it
+ME_WORDS = ("me", "mine", "self", "player", "")
+_ASCII_NUMBER = re.compile(r"[0-9]+")
 
-INSTRUCTIONS = """\
-Unofficial MCP server for the Backseat Champions Game API. You are the race engineer for player one's car (seat 0).
-The car is driven by the game's AI; you manage it: pick and ban upgrade cards, call pit stops, choose tire
-compounds, hold boost buttons. The server never acts on its own.
 
-Workflow: call get_api_status once, then loop on wait_for_trigger. It returns when a decision is needed:
-card_offer (pick_card / ban_card), car_damaged or tires_wont_last (decide set_pit(true); then pick_tire when the tire
-screen opens). Query anything else on demand (get_race_snapshot, get_standings, get_player_state, ...).
-Telemetry only exists during a session and only for the switches enabled in the game under Settings > Telemetry.
-"""
+def progress_interval(environ):
+    """BC_PROGRESS_INTERVAL_S (seconds between MCP progress notifications during waits; default 10)."""
+    raw = (environ.get("BC_PROGRESS_INTERVAL_S") or "").strip()
+    if not raw:
+        return 10.0
+    try:
+        value = float(raw)
+    except ValueError:
+        value = float("nan")
+    if not math.isfinite(value) or not 0 < value <= 60:
+        raise ValueError("BC_PROGRESS_INTERVAL_S must be a number of seconds above 0 and at most 60, got %r" % raw)
+    return value
 
+
+try:
+    PROGRESS_INTERVAL_S = progress_interval(os.environ)
+except ValueError:                   # reported cleanly by main() (config_from_args); never a traceback at import
+    PROGRESS_INTERVAL_S = 10.0
 
 # ------------------------------------------------------------------------------------------------ formatting
 
-def clean(value, digits=3):
-    """Round floats (NaN/inf -> None) recursively, for compact JSON."""
+MAX_CLEAN_DEPTH = 100
+
+
+def clean(value, digits=3, _depth=0):
+    """Round floats (NaN/inf -> None) recursively, for compact JSON. Deeper than MAX_CLEAN_DEPTH -> None."""
     if isinstance(value, float):
         if not math.isfinite(value):
             return None
-        return round(value, digits)
+        return value if digits is None else round(value, digits)
+    if isinstance(value, (dict, list, tuple)) and _depth >= MAX_CLEAN_DEPTH:
+        return None
     if isinstance(value, dict):
-        return {k: clean(v, digits) for k, v in value.items()}
+        return {k: clean(v, digits, _depth + 1) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        return [clean(v, digits) for v in value]
+        return [clean(v, digits, _depth + 1) for v in value]
     return value
 
 
 def _finite(value):
     """Non-finite floats (a hostile or broken datagram's NaN/inf) -> None, so tool output is always valid JSON."""
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    if isinstance(value, dict):
-        return {k: _finite(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_finite(v) for v in value]
-    return value
+    return clean(value, None)
 
 
 def _result(out):
@@ -80,13 +101,17 @@ def _result(out):
     return CallToolResult(content=[TextContent(type="text", text=text)], is_error=is_error)
 
 
-READ = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
-WAIT = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=False, open_world_hint=False)
+# Every tool that reads the game (live telemetry / UDP) is open-world (D11); only the static reference and this
+# server's own trigger configuration are not.
+READ = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True)
+READ_NET = READ                  # read tools that also send a UDP command (hello / ping) to the game
+READ_LOCAL = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
+WAIT = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=False, open_world_hint=True)
 
 
 def _write(destructive, idempotent, title=None):
     return ToolAnnotations(title=title, read_only_hint=False, destructive_hint=destructive,
-                           idempotent_hint=idempotent, open_world_hint=False)
+                           idempotent_hint=idempotent, open_world_hint=True)      # sends UDP to the game
 
 
 # ------------------------------------------------------------------------------------------------ shared state
@@ -100,11 +125,9 @@ class AppState:
         self.results = None
         if config.results_port is not None:
             self.results = ResultsReceiver(config.results_host, config.results_port, config.results_token,
-                                           config.results_dir)
+                                           config.results_dir, config.results_keep)
         self.users = 0
         self.lock = asyncio.Lock()
-        self.last_ctx = None
-        self.client.triggers.listeners.append(self._on_trigger)
 
     @contextlib.asynccontextmanager
     async def use(self):
@@ -123,33 +146,6 @@ class AppState:
                     await self.client.stop()
                     if self.results is not None:
                         self.results.stop()
-
-    def remember(self, ctx):
-        if ctx is not None:
-            self.last_ctx = ctx
-
-    def _on_trigger(self, trig):
-        """Best effort: tell the client that bc://triggers/latest changed, and log the trigger."""
-        ctx = self.last_ctx
-        if ctx is None:
-            return
-        try:
-            asyncio.get_running_loop().create_task(self._notify(ctx, trig))
-        except RuntimeError:
-            pass
-
-    async def _notify(self, ctx, trig):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            for send in (lambda: ctx.session.send_resource_updated(TRIGGERS_URI),
-                         lambda: ctx.notify_resource_updated(TRIGGERS_URI),
-                         lambda: ctx.session.send_log_message(
-                             level="notice", data={"trigger": trig["type"], "seq": trig["seq"]},
-                             logger="backseat_champions_mcp.triggers")):
-                try:
-                    await asyncio.wait_for(send(), 2.0)
-                except Exception:  # the session may be gone, or the client may not take it
-                    pass
 
 
 # ------------------------------------------------------------------------------------------------ server
@@ -172,38 +168,131 @@ def build_server(config, log_level="WARNING"):
         def decorator(fn):
             @functools.wraps(fn)
             async def wrapper(*args, **kwargs):
-                for value in list(args) + list(kwargs.values()):
-                    if isinstance(value, Context):
-                        state.remember(value)
                 try:
                     out = await fn(*args, **kwargs)
                 except ValueError as e:
                     out = failure("bad_argument", detail="(%s)" % e)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # never a bare "Error executing tool": always the structured shape
+                    log.exception("tool %s failed", fn.__name__)
+                    out = failure("server_error", detail="(%s: %s)" % (type(e).__name__, e))
                 return _result(out)
-            mcp.add_tool(wrapper, name=name or fn.__name__, annotations=annotations, structured_output=False)
+            # cleandoc: Python 3.13 dedents docstrings itself and 3.10 does not; clients get the same text (V-D5)
+            mcp.add_tool(wrapper, name=name or fn.__name__, description=inspect.cleandoc(fn.__doc__ or ""),
+                         annotations=annotations, structured_output=False)
             return fn
         return decorator
 
     # ------------------------------------------------------------------ helpers
 
-    def names():
+    engine = client.triggers
+
+    class Names(dict):
+        """Car index -> Participants entry, valid for the packet whose header it was built for (X7).
+
+        The game re-orders car indices by race position mid-session (seen in 0.88.2) and Participants only comes
+        every 5 s, so another car's name is attached only when the Participants packet has the same frame as the
+        packet being labelled. My own car is always named: through Participants' own seat_car[0] (its player_id is
+        stable), and the labelled packet's own seat_car[0] says which of its rows is mine."""
+        me = None
+        exact = False
+        note = None
+
+    def names(header):
+        info = Names()
+        info.me = header["seat_car"][0] if header is not None else client.my_car()
         got = client.latest(P.PKT_PARTICIPANTS)
         if got is None:
-            return {}
-        return {i: c for i, c in enumerate(got[1]["cars"])}
+            return info
+        ph, body, _age = got
+        cars = body["cars"]
+        if header is not None and ph["frame"] == header.get("frame"):
+            info.exact = True
+            info.update(enumerate(cars))
+            return info
+        pme = ph["seat_car"][0]
+        if info.me is not None and pme is not None and pme < len(cars):
+            info[info.me] = cars[pme]
+        info.note = ("Only your own car is named: names come from the Participants packet (every 5 s, frame %d) and "
+                     "this packet is from frame %s; the game re-orders car indices by race position mid-session, so "
+                     "another car's name could be wrong. get_participants lists every name with its age."
+                     % (ph["frame"], None if header is None else header.get("frame")))
+        return info
 
-    def label(car, info=None):
-        info = names() if info is None else info
+    def label(car, info):
         out = {"car": car}
         p = info.get(car)
         if p:
-            out.update(name=p["name"], car_type=p["car_type"], kind=p["kind"])
-        if car == client.my_car():
+            out.update(name=p["name"], car_type=p["car_type"], kind=p["kind"], player_id=p["player_id"])
+        if car == info.me:
             out["is_me"] = True
         return out
 
+    def add_names_note(out, info):
+        if info.note:
+            out["names_note"] = info.note
+        return out
+
+    def session_ended_info():
+        """client.paused() when it reports the session ended (SEND / FINI seen), else None (V-T4)."""
+        p = client.paused()
+        if p and p.get("session_ended"):
+            return dict(p)
+        return None
+
+    def paused_info():
+        """client.paused() plus the trigger engine's view of the card hand (X4), or None when not paused.
+
+        A session that ended (SEND / FINI) is not a pause, even if Session / Car Status still stream (V-T4)."""
+        p = client.paused()
+        if not p or not p.get("paused") or p.get("session_ended"):
+            return None
+        p = dict(p)
+        with contextlib.suppress(Exception):
+            p["card_hand_pending"] = engine.card_state().get("open")
+        hint = None
+        with contextlib.suppress(Exception):
+            hint = engine.paused_hint(True, p.get("session_time_frozen_for_s") or 0.0)
+        if hint:
+            p["paused_hint"] = hint
+        return p
+
+    def current_points(cs=None):
+        """Upgrade points now (G8, V-D8): from the newer of the newest Player sample and the card offer of the
+        engine's last hand (CARD event or Player), by frame (then arrival order). Spending the last point therefore
+        shows 0 as soon as a Player sample says so, even though the last hand was offered with 1."""
+        cs = engine.card_state() if cs is None else cs
+        pl = client.latest(P.PKT_PLAYER, 0)
+        if pl is None:
+            return cs.get("points")
+        lc = getattr(engine, "_last_card", None)
+        if not lc or lc.get("fired_frame") is None:
+            return pl[1]["points"]
+        player = (pl[0]["frame"], getattr(engine, "_player_no", None) or 0)
+        offer = (lc["fired_frame"], lc.get("fired_no") or 0)
+        return pl[1]["points"] if player >= offer else cs.get("points")
+
+    def open_decisions():
+        """The open (or unknown) card hand / tire screen, from the trigger engine's live state."""
+        return clean(engine.open_decisions())
+
+    def never_returned():
+        if hasattr(engine, "undelivered"):
+            return engine.undelivered()
+        return sum(1 for e in engine.triggers if not e.get("returns"))
+
     def stale_note(pid, age):
         if age > client.stale_after(pid):
+            if session_ended_info():
+                return ("This data is %.1f s old because the session has ended (SEND / FINI seen). It is the state "
+                        "at the end." % age)
+            paused = paused_info()
+            if paused:
+                why = ("a card hand waits for pick_card" if paused.get("card_hand_pending") is True
+                       else "this server knows of no open card hand, so the reason is unknown")
+                return ("This data is %.1f s old because the game is paused (session_time is not advancing; %s). "
+                        "It is the state at the pause." % (age, why))
             return ("This data is %.1f s old: telemetry has stopped (session over, game paused or closed, or the "
                     "switch was turned off)." % age)
         return None
@@ -216,48 +305,125 @@ def build_server(config, log_level="WARNING"):
 
     def base(pid, header, age):
         out = {"ok": True, "age_s": round(age, 2), "session_uid": header["session_uid"],
-               "session_time_s": round(header["session_time"], 2)}
+               "session_time_s": round(header["session_time"], 2), "frame": header["frame"]}
         note = stale_note(pid, age)
         if note:
             out["stale"] = True
             out["stale_note"] = note
+            if paused_info():
+                out["paused"] = True
         return out
 
-    def select_cars(car, count):
-        """List of car indices for a car selector: "me", "all", or an index."""
+    def _position_selector(key):
+        """"ahead" / "behind" / "p<n>" -> wanted position, or None when key is not such a selector."""
+        if key in ("ahead", "behind"):
+            return key
+        if len(key) > 1 and key[0] == "p" and _ASCII_NUMBER.fullmatch(key[1:]):    # ASCII digits only (V-T10)
+            return int(key[1:])
+        return None
+
+    def select_cars(car, count, header):
+        """``(indices, meta)`` for a car selector, as indices of the packet whose ``header`` is given.
+
+        "me": the packet's own seat_car[0]. "all": every car. "ahead" / "behind" / "P<n>": resolved by race
+        position in the NEWEST Lap Data packet (X8); meta says which index that gave and, when the Lap Data
+        packet is from another frame than this packet, the frame difference. An integer index is taken as is
+        (valid for this instant only)."""
+        me = header["seat_car"][0] if header is not None else client.my_car()
         if car is None:
             car = "me"
         if isinstance(car, str):
             key = car.strip().lower()
-            if key in ("me", "mine", "self", "player", ""):
-                me = client.my_car()
+            if key in ME_WORDS:
                 if me is None:
                     raise ValueError("seat 0 has no car in this session (seat_car[0] is 255)")
                 if me >= count:
                     raise ValueError("seat 0's car index %d is not among the %d cars of this packet" % (me, count))
-                return [me]
+                return [me], {"resolved_car_index": me}
             if key == "all":
-                return list(range(count))
-            if not key.isdigit():
-                raise ValueError("car must be \"me\", \"all\" or a car index 0..%d, got %r" % (max(count - 1, 0), car))
+                return list(range(count)), {}
+            want = _position_selector(key)
+            if want is not None:
+                return _resolve_position(key, want, count, header)
+            if not _ASCII_NUMBER.fullmatch(key):
+                raise ValueError('car must be "me", "ahead", "behind", "P<n>", "all" or a car index 0..%d, got %r'
+                                 % (max(count - 1, 0), car))
             car = int(key)
-        if isinstance(car, bool) or not (0 <= car < max(count, 1)) or car >= P.MAX_CARS:
+        if isinstance(car, bool) or not isinstance(car, int):
+            raise ValueError("car must be a selector or an integer index, got %r" % (car,))
+        if count <= 0:
+            raise ValueError("car index %d is out of range: this packet has no cars (num_cars 0)" % car)
+        if not (0 <= car < count) or car >= P.MAX_CARS:
             raise ValueError("car index %r is out of range: this session has %d cars (0..%d)"
                              % (car, count, count - 1))
-        return [car]
+        return [car], {"resolved_car_index": car}
+
+    def _resolve_position(key, want, count, header):
+        lap = client.latest(P.PKT_LAP_DATA)
+        if lap is None:
+            raise ValueError("car=%r needs Lap Data (Driver Data switch) to find positions; none has arrived" % key)
+        lh, lb, _age = lap
+        cars = lb["cars"][:min(lh["num_cars"], P.MAX_CARS) or len(lb["cars"])]
+        if want in ("ahead", "behind"):
+            lme = lh["seat_car"][0]
+            if lme is None or lme >= len(cars) or not cars[lme]["position"]:
+                raise ValueError("car=%r: your position is unknown in the newest Lap Data packet" % key)
+            mine = cars[lme]["position"]
+            pos = mine - 1 if want == "ahead" else mine + 1
+            if pos < 1:
+                raise ValueError("car='ahead': you are in position 1, there is no car ahead")
+        else:
+            pos = want
+        found = [i for i, c in enumerate(cars) if c["position"] == pos]
+        if not found:
+            raise ValueError("car=%r: no car is in position %d (%d cars)" % (key, pos, len(cars)))
+        idx = found[0]
+        if idx >= count:
+            raise ValueError("car=%r resolved to index %d, which is not in this packet's %d cars" % (key, idx, count))
+        meta = {"selector": key, "resolved_car_index": idx, "resolved_position": pos}
+        add_lap_delta(meta, header, lh["frame"])
+        return [idx], meta
+
+    def add_lap_delta(meta, header, lap_frame):
+        """Say how far the Lap Data packet a selector was resolved with is from the packet it labels (X8)."""
+        if header is None or lap_frame is None or header.get("frame") == lap_frame:
+            return meta
+        meta["resolved_from_lap_data_frame_delta"] = header["frame"] - lap_frame
+        meta["selector_note"] = ("Resolved by position in the newest Lap Data packet, %d frame(s) %s this packet; "
+                                 "indices can change when positions change." %
+                                 (abs(header["frame"] - lap_frame), "before" if header["frame"] > lap_frame
+                                  else "after"))
+        return meta
 
     def energy_kind():
         got = client.latest(P.PKT_SESSION)
         return None if got is None else got[1]["energy"]
 
-    CarParam = Annotated[Union[int, str], Field(
-        description='Which car: "me" (player one\'s car, the default), "all" (every car in the session), or a car '
-                    'index 0..15 (the car\'s position in the participant list, fixed for the session; see '
-                    'get_participants).')]
+    CarParam = Annotated[Union[SInt, SStr], Field(
+        description='Which car: "me" (player one\'s car, the default), "ahead" / "behind" (the car one position '
+                    'ahead of / behind you), "P<n>" (the car in race position n, e.g. "P1"), "all" (every car), or a '
+                    'car index 0..15. Positions are read from the newest Lap Data packet. An index is valid for this '
+                    'instant only: the game re-orders car indices by race position mid-session (seen in 0.88.2), so '
+                    'never reuse an index from an earlier result; follow a car by player_id or use a selector.')]
 
     # ================================================================== status
 
-    @tool(READ)
+    def expected_missing(flags, ages):
+        """Packet types the broadcast switches should send but that have not arrived within their stale limit."""
+        out = []
+        for pid in (P.PKT_MOTION, P.PKT_CAR_TELEMETRY, P.PKT_LAP_DATA, P.PKT_CAR_STATUS, P.PKT_PLAYER,
+                    P.PKT_SESSION, P.PKT_PARTICIPANTS, P.PKT_CAR_ABILITIES, P.PKT_RACING_LINE,
+                    P.PKT_AI_OBSERVATIONS):
+            switches = R.PACKET_SWITCHES.get(pid, ())
+            if not any(flags.get(sw) for sw in switches):
+                continue
+            name = P.PACKET_NAMES[pid]
+            age = ages.get(name)
+            if age is None or age > client.stale_after(pid):
+                out.append(name)
+        return out
+
+    @tool(READ_NET)
     async def get_api_status(ctx: Context) -> dict:
         """Check the connection to the game and what is switched on. Call this first.
 
@@ -266,11 +432,18 @@ def build_server(config, log_level="WARNING"):
         - game: reachable, game_version, rate_hz, feature schema version/hash, `inputs` (player_input,
           driver_input, public_lobby) and `broadcast` switches (driver_data, player_data, decision_events,
           ai_observations).
-        - switches_off: each broadcast/input switch that is off, with the tools that cannot work without it.
-          Settings live in the game under Settings > Telemetry (the API is off by default).
-        - telemetry listener: bound address, whether packets are arriving, last packet age, counts per packet
-          type, session_uid, my car index (seat 0).
-        - holds (running boost/drive repeats and any error that ended one), trigger summary, results receiver.
+        - switches_off: each broadcast/input switch that is off, with `required` and the tools that cannot work
+          without it (Driver Data, Player Data, Decision Events, Player Input are required by the trigger loop; AI
+          Observations and Driver Input are optional; Driver Input is only listed when the drive tools are
+          registered). required_switches_off: just the required ones. Settings live in the game under
+          Settings > Telemetry (the API is off by default).
+        - telemetry listener: bound address, whether packets are arriving, last packet age, counts and
+          last_seen_age_s per packet type, expected_not_arriving (types the switches should send that have not
+          come recently), paused (false, or {paused, session_time_frozen_for_s, card_hand_pending, ...}: the game
+          stops time while a card hand waits), packets dropped for an unknown packet_version, session_uid, my car
+          index (seat 0; can change mid-session, see get_participants).
+        - holds (running boost/drive repeats and any error that ended one), trigger summary (queued, last_seq,
+          acked_up_to_seq, open_decisions), results receiver.
         - config: ports, whether a command token is set (never the token itself), whether drive tools exist.
         Needs nothing switched on. If the game does not answer, `game.reachable` is false with a hint (game not
         running, API off, wrong BC_COMMAND_HOST/PORT, or a missing Command Token for a remote game).
@@ -292,14 +465,28 @@ def build_server(config, log_level="WARNING"):
             off = []
             for key, info in R.BROADCAST_SWITCHES.items():
                 if not h[key]:
-                    off.append({"switch": info["label"], "kind": "broadcast", "affects": info["tools"]})
+                    tools = list(info["tools"])
+                    # Car Abilities needs Driver Data OR Player Data: only lost when both are off
+                    other = {"driver_data": "player_data", "player_data": "driver_data"}.get(key)
+                    if other and h[other]:
+                        tools = [t for t in tools if t != "get_car_abilities"]
+                    off.append({"switch": info["label"], "kind": "broadcast", "required": key in R.REQUIRED_SWITCHES,
+                                "affects": tools})
             for key, info in R.INPUT_SWITCHES.items():
                 if not h[key]:
-                    off.append({"switch": info["label"], "kind": "input", "affects": info["tools"]})
+                    if key == "driver_input" and not config.allow_drive:
+                        continue                 # only drive / release_drive need it, and they are not registered
+                    off.append({"switch": info["label"], "kind": "input", "required": key in R.REQUIRED_SWITCHES,
+                                "affects": info["tools"]})
             game["switches_off"] = off
-            if off:
-                warnings_.append("Switch these on under %s to use the affected tools: %s."
-                                 % (R.SETTINGS_PATH, ", ".join(o["switch"] for o in off)))
+            required = [o["switch"] for o in off if o["required"]]
+            optional = [o["switch"] for o in off if not o["required"]]
+            game["required_switches_off"] = required
+            if required:
+                warnings_.append("Required for the race-engineer loop and off: %s. Switch them on under %s."
+                                 % (", ".join(required), R.SETTINGS_PATH))
+            if optional:
+                warnings_.append("Optional and off (only the listed tools are affected): %s." % ", ".join(optional))
             if h["public_lobby"]:
                 warnings_.append("Public lobby: every command except ping, hello and set_camera is refused "
                                  "(public_lobby). Read tools still work.")
@@ -311,17 +498,41 @@ def build_server(config, log_level="WARNING"):
         out["game"] = game
         listener = client.listener_status()
         listener["my_car"] = client.my_car()
-        listener["num_cars"] = client.num_cars
+        listener["my_car_note"] = ("seat_car[0] of the newest packet. The game re-orders car indices by race position "
+                                   "mid-session (seen in 0.88.2), so this index can change; player_id does not.")
+        listener["num_cars"] = min(client.num_cars, P.MAX_CARS)
         out["telemetry"] = listener
+        for text in listener.get("warnings") or []:          # e.g. packets dropped for an unknown packet_version (T3)
+            warnings_.append(text)
+        paused = paused_info()
+        listener["paused"] = paused or False
+        ended = session_ended_info()
+        if ended:
+            listener["session_ended"] = True
+            if ended.get("note"):
+                warnings_.append(ended["note"])
+        if paused:
+            if paused.get("note"):
+                warnings_.append(paused["note"])
+            if paused.get("paused_hint"):
+                warnings_.append(paused["paused_hint"])
         if not listener["bound"]:
             out["telemetry"]["problem"] = client.listener_failure()
         elif not listener["receiving"]:
             warnings_.append("No telemetry is arriving. The game sends telemetry only during a session (practice, "
                              "qualifying or race).")
+        elif hello["ok"]:
+            missing = expected_missing(hello["hello"], listener["last_seen_age_s"])
+            # while paused the configured-rate packets stop by design (L3): not reported as missing
+            if missing and not paused and not ended:
+                listener["expected_not_arriving"] = missing
+                warnings_.append("Telemetry arrives, but these packet types the switches should send have not "
+                                 "arrived recently: %s. Check the switches and that nothing else receives on the "
+                                 "telemetry port." % ", ".join(missing))
         out["holds"] = client.hold_status()
-        trig = client.triggers
-        out["triggers"] = {"enabled": sorted(trig.config.enabled), "queued": len(trig.triggers),
-                           "last_seq": trig.seq, "undelivered": len(trig.pending()[0])}
+        out["triggers"] = {"enabled": sorted(engine.config.enabled), "queued": len(engine.triggers),
+                           "last_seq": engine.seq, "acked_up_to_seq": getattr(engine, "acked", None),
+                           "never_returned": never_returned(), "open_decisions": open_decisions()}
         if state.results is not None:
             out["results_receiver"] = state.results.status()
         out["config"] = config.public()
@@ -329,7 +540,7 @@ def build_server(config, log_level="WARNING"):
             out["warnings"] = warnings_
         return out
 
-    @tool(READ)
+    @tool(READ_NET)
     async def ping(ctx: Context) -> dict:
         """Liveness check: send the Game API `ping` command and wait for its Ack.
 
@@ -365,7 +576,7 @@ def build_server(config, log_level="WARNING"):
             return err
         header, body, age = got
         out = base(P.PKT_SESSION, header, age)
-        out.update(num_cars=header["num_cars"], my_car=header["seat_car"][0], game_version=header["game_version"],
+        out.update(num_cars=min(header["num_cars"], P.MAX_CARS), my_car=header["seat_car"][0], game_version=header["game_version"],
                    session_type=body["session_type"], energy_kind=body["energy"], total_laps=body["total_laps"],
                    weather=body["weather"], player_input=body["player_input"], driver_input=body["driver_input"],
                    public_lobby=body["public_lobby"], scene=body["scene"], track=body["track"],
@@ -378,19 +589,24 @@ def build_server(config, log_level="WARNING"):
         """Every car in the session with its driver's display name, car type and kind.
 
         Source: Participants packet (id 6; every 5 s and when a session starts; needs Driver Data). Per car:
-        car (index 0..15, fixed for the session; the index every other tool uses), name (display name; other
+        car (index 0..15 as of this packet's frame; valid for that instant only: the game re-orders car indices
+        by race position mid-session (seen in 0.88.2), so follow a car by player_id), name (display name; other
         online players' names included), car_type (Formula, ClassicFormula, ModernFormula, Endurance, GT2, Stock,
         FormulaOldskool, FormulaLegacy), kind (ai, local = a player on this machine, remote = a player on another
-        machine), player_id (not the car index), is_me for seat 0's car.
+        machine), player_id (stable for the session), is_me for seat 0's car (by this packet's own header).
+        Also frame and age_s of the packet, and a note: the indices may have changed since.
         """
         got, err = await need(P.PKT_PARTICIPANTS, what="Participants")
         if err:
             return err
         header, body, age = got
         out = base(P.PKT_PARTICIPANTS, header, age)
-        me = client.my_car()
+        me = header["seat_car"][0]                   # this packet's own index of seat 0's car
         out["cars"] = [dict({"car": i}, **c, **({"is_me": True} if i == me else {}))
                        for i, c in enumerate(body["cars"])]
+        out["note"] = ("Car indices as of frame %d (%.1f s ago). The game re-orders indices by race position "
+                       "mid-session, so they may have changed since; player_id identifies a car."
+                       % (header["frame"], age))
         return out
 
     @tool(READ)
@@ -402,13 +618,16 @@ def build_server(config, log_level="WARNING"):
         gap_to_leader_s, interval_ahead_s, interval_behind_s (seconds; the game does not document the sign of
         interval_behind and real captures show it negative, so read it as a magnitude), pit_stops, in_pits
         (in the pit lane), finished, pit_planned (only ever true for this machine's cars: a rival's call is never
-        shown), api_driving (an API client is driving that car), is_me.
+        shown), api_driving (an API client is driving that car), is_me (by this packet's own header), name,
+        car_type, kind, player_id. Names come from Participants (every 5 s): other cars are named only when that
+        packet is from the same frame as this one; otherwise only your own car is named and names_note says why
+        (the game re-orders car indices by race position mid-session). car is valid for this instant only.
         """
         got, err = await need(P.PKT_LAP_DATA, what="Lap Data")
         if err:
             return err
         header, body, age = got
-        info = names()
+        info = names(header)
         rows = []
         for i, c in enumerate(body["cars"]):
             row = {"position": c["position"], "class_position": c["class_position"]}
@@ -420,14 +639,24 @@ def build_server(config, log_level="WARNING"):
         rows.sort(key=lambda r: (r["position"] or 99, r["car"]))
         out = base(P.PKT_LAP_DATA, header, age)
         out["standings"] = rows
-        if not info:
-            out["note"] = "No Participants packet yet (sent every 5 s): names are missing."
+        add_names_note(out, info)
+        notes = []
+        if not rows:
+            notes.append("This Lap Data packet lists no cars (num_cars %d)." % header["num_cars"])
+        participants = client.latest(P.PKT_PARTICIPANTS)
+        if participants is None:
+            notes.append("No Participants packet yet (sent every 5 s): names are missing.")
+        elif not participants[1]["cars"]:
+            notes.append("The newest Participants packet lists no cars (num_cars %d): names are missing."
+                         % participants[0]["num_cars"])
+        if notes:
+            out["note"] = " ".join(notes)
         return clean(out, 3)
 
     @tool(READ)
     async def get_car_telemetry(
             ctx: Context, car: CarParam = "me",
-            include_wheels: Annotated[bool, Field(description="Include the four wheels (front two, then rear two): "
+            include_wheels: Annotated[bool, Field(strict=True, description="Include the four wheels (front two, then rear two): "
                                                              "on_track, grounded, slip_forward, slip_sideways.")] = False
     ) -> dict:
         """Speed, applied pedal and steer, tires and energy of one car or all cars.
@@ -436,16 +665,17 @@ def build_server(config, log_level="WARNING"):
         pedal (-1 full brake to 1 full throttle, as applied), steer (-1 left to 1 right, as applied),
         tire_compound (Standard, Boost, Experimental, Fast, Durable, Wet, Golden), tire_health (1 new, 0 worn
         out), puncture, energy (boost or fuel left, 0 to 1; energy_kind says which), wheels_on_track and
-        wheels_grounded (count of 4), and with include_wheels the per-wheel data (slip is unitless and 0 while
-        off the ground).
+        wheels_grounded (count of 4), and with include_wheels the per-wheel data (slip's unit and scale are not
+        documented by the game; it is 0 while off the ground).
         """
         got, err = await need(P.PKT_CAR_TELEMETRY, what="Car Telemetry")
         if err:
             return err
         header, body, age = got
-        info = names()
+        info = names(header)
         cars = []
-        for i in select_cars(car, len(body["cars"])):
+        indices, sel = select_cars(car, len(body["cars"]), header)
+        for i in indices:
             c = body["cars"][i]
             row = label(i, info)
             row.update(speed_kmh=round(c["speed_kmh"], 1), pedal=c["pedal"], steer=c["steer"],
@@ -457,6 +687,8 @@ def build_server(config, log_level="WARNING"):
                 row["wheels"] = c["wheels"]
             cars.append(row)
         out = base(P.PKT_CAR_TELEMETRY, header, age)
+        out.update(sel)
+        add_names_note(out, info)
         out["energy_kind"] = energy_kind()
         out["cars"] = cars
         return clean(out)
@@ -473,9 +705,10 @@ def build_server(config, log_level="WARNING"):
         if err:
             return err
         header, body, age = got
-        info = names()
+        info = names(header)
         cars = []
-        for i in select_cars(car, len(body["cars"])):
+        indices, sel = select_cars(car, len(body["cars"]), header)
+        for i in indices:
             c = body["cars"][i]
             row = label(i, info)
             row.update(position_m=clean(c["position"], 2), velocity_m_s=clean(c["velocity"], 2),
@@ -484,6 +717,8 @@ def build_server(config, log_level="WARNING"):
                        roll_deg=round(c["roll"], 2), yaw_deg=round(c["yaw"], 2))
             cars.append(row)
         out = base(P.PKT_MOTION, header, age)
+        out.update(sel)
+        add_names_note(out, info)
         out["cars"] = cars
         return out
 
@@ -502,16 +737,19 @@ def build_server(config, log_level="WARNING"):
         if err:
             return err
         header, body, age = got
-        info = names()
+        info = names(header)
         cars = []
-        for i in select_cars(car, len(body["cars"])):
+        indices, sel = select_cars(car, len(body["cars"]), header)
+        for i in indices:
             row = label(i, info)
             row["performance"] = body["cars"][i]["performance"]
             cars.append(row)
         out = base(P.PKT_CAR_STATUS, header, age)
+        out.update(sel)
+        add_names_note(out, info)
         out["cars"] = cars
         if body["cars"]:
-            out["field_median"] = {a: sorted(c["performance"][a] for c in body["cars"])[len(body["cars"]) // 2]
+            out["field_median"] = {a: statistics.median(c["performance"][a] for c in body["cars"])
                                    for a in P.PERFORMANCE_AREAS}
         return clean(out)
 
@@ -531,21 +769,24 @@ def build_server(config, log_level="WARNING"):
         if err:
             return err
         header, body, age = got
-        info = names()
+        info = names(header)
         cars = []
-        for i in select_cars(car, len(body["cars"])):
+        indices, sel = select_cars(car, len(body["cars"]), header)
+        for i in indices:
             c = body["cars"][i]
             row = label(i, info)
             row["active"] = [k for k in ("speed_boost", "cornering_boost", "super_boost", "party_mode", "drs",
                                          "boost_overspeed", "recharging") if c[k]]
             row.update(slipstream=c["slipstream"], recharge_left=c["recharge_left"])
-            if i == client.my_car() or (info.get(i) or {}).get("kind") == "local":
+            if i in header["seat_car"]:          # this machine's seats, by this packet's own header (T6)
                 row["unlocked"] = [k for k, f in (("super_boost", "super_boost_unlocked"),
                                                   ("party_mode", "party_mode_unlocked"),
                                                   ("drs", "drs_unlocked")) if c[f]]
                 row.update(api_boosting=c["api_boosting"], ban_tokens=c["ban_tokens"])
             cars.append(row)
         out = base(P.PKT_CAR_ABILITIES, header, age)
+        out.update(sel)
+        add_names_note(out, info)
         out["cars"] = cars
         return clean(out)
 
@@ -576,7 +817,7 @@ def build_server(config, log_level="WARNING"):
     @tool(READ)
     async def get_player_state(
             ctx: Context,
-            include_strategy_blocks: Annotated[bool, Field(
+            include_strategy_blocks: Annotated[bool, Field(strict=True,
                 description="Also return the raw strategy blocks `opponents` (194 floats) and `near` (42 floats), "
                             "the Extreme AI's input in its FeatureSchema order (layout not documented; identified "
                             "by feature_schema_version/hash). Large; off by default.")] = False
@@ -590,7 +831,7 @@ def build_server(config, log_level="WARNING"):
         puncture, compound_picks_left (per compound; null = no limit)}, energy (0..1, fuel or boost per
         energy_kind), strategy (null when the seat has no strategy model): start_grid_position, laps_since_pit,
         tire_age_laps, cars_within_5s_ahead/behind, class_position, class_size, class_gap_to_leader/ahead/behind
-        (seconds), reference_lap_s (seconds).
+        (seconds, inferred from the field names), reference_lap_s (seconds).
         """
         got, err = await need(P.PKT_PLAYER, 0, what="Player")
         if err:
@@ -600,58 +841,58 @@ def build_server(config, log_level="WARNING"):
         out.update(player_view(body, include_strategy_blocks))
         return clean(out)
 
+    def ban_tokens_now():
+        ab = client.latest(P.PKT_CAR_ABILITIES)
+        me = None if ab is None else ab[0]["seat_car"][0]      # the Car Abilities packet's own index of my car
+        if ab is not None and me is not None and me < len(ab[1]["cars"]):
+            return ab[1]["cars"][me]["ban_tokens"]
+        return None
+
     @tool(READ)
     async def get_pending_decisions(ctx: Context) -> dict:
-        """What currently needs an answer: unspent points and the hand, the pit call, the tire screen.
+        """What currently needs an answer: the card hand, the tire screen, the pit call.
 
-        Combines Player (id 4; Player Data), Car Abilities (ban tokens) and the latest seat-0 events
-        (CARD, PITW, TIRE; Decision Events):
-        - cards: open (points > 0 and a hand), points, hand, ban_tokens, source. Answer with pick_card(index) or
-          ban_card(index).
-        - pit: pit_planned, can_call_now, in_pits, and the latest PITW event (sent each new lap). Answer with
-          set_pit(true/false).
-        - tire_screen: the latest TIRE event if it has not been answered or closed (pre_race, current, allowed
-          compounds, picks_left). The open/closed state is only known from events: the screen is presumed closed
-          after a successful pick_tire, a tire_select_closed error, leaving the pit lane, or session end. Answer
-          with pick_tire(compound).
+        From the trigger engine's live state (CARD / TIRE events with Decision Events, the Player packet with
+        Player Data) plus Car Abilities (ban tokens):
+        - cards: open (true; false; null = unknown, e.g. Player Data off and the race resumed), points, hand
+          (index, upgrade, facility, tier, banned), seq (the card_offer trigger of this hand: pass it to
+          pick_card / ban_card), in_pits, source, closed_because, ban_tokens. Answer with pick_card(index, seq).
+        - tire_screen: open, pre_race, current, allowed compounds, picks_left (null = no limit), seq. Closed by a
+          successful pick_tire, leaving the pit lane, the car driving off the grid, or the session ending.
+          Answer with pick_tire(compound).
+        - pit: pit_planned, can_call_now, in_pits (Player packet), and the latest PITW event (sent each new lap).
+          Answer with set_pit(true/false).
+        - paused: present while the game is paused (it pauses while a card hand waits).
         """
         out = {"ok": True}
+        cards = dict(engine.card_state())
+        cards["points"] = current_points(cards)
+        tokens = ban_tokens_now()
+        if tokens is not None or "ban_tokens" not in cards:
+            cards["ban_tokens"] = tokens
+        out["cards"] = cards
+        out["tire_screen"] = dict(engine.tire_state())
         got = client.latest(P.PKT_PLAYER, 0)
-        ab = client.latest(P.PKT_CAR_ABILITIES)
-        me = client.my_car()
-        tokens = None
-        if ab is not None and me is not None and me < len(ab[1]["cars"]):
-            tokens = ab[1]["cars"][me]["ban_tokens"]
         if got is not None:
             header, body, age = got
-            out["age_s"] = round(age, 2)
-            out["cards"] = {"open": body["points"] > 0 and bool(body["hand"]), "points": body["points"],
-                            "hand": body["hand"], "ban_tokens": tokens, "source": "Player packet"}
             out["pit"] = {"pit_planned": body["pit_planned"], "can_call_now": body["can_pit"],
-                          "in_pits": body["in_pits"], "laps_remaining": body["laps_remaining"]}
-        elif client.card_event is not None:
-            e = client.card_event
-            out["cards"] = {"open": True, "points": e["points"], "hand": e["hand"], "ban_tokens": tokens,
-                            "source": "CARD event (Player Data is off)"}
-        else:
-            out["cards"] = None
+                          "in_pits": body["in_pits"], "age_s": round(age, 2)}
         if client.pit_event is not None:
             out.setdefault("pit", {})["last_pit_window_event"] = client.public_event(client.pit_event)
-        out["tire_screen"] = (client.public_event(client.tire_event) if client.tire_event is not None
-                              else {"open": False})
-        if client.tire_event is not None:
-            out["tire_screen"]["open"] = True
-        if got is None and client.card_event is None and client.pit_event is None:
+        paused = paused_info()
+        if paused:
+            out["paused"] = paused
+        if got is None and client.card_event is None and client.pit_event is None and client.tire_event is None:
             fail = await client.no_data_failure(P.PKT_PLAYER, "Player")
             out["note"] = fail.get("explanation")
             out["hint"] = fail.get("hint")
-        out["undelivered_triggers"] = len(client.triggers.pending()[0])
+        out["open_decisions"] = open_decisions()
         return clean(out)
 
     @tool(READ)
     async def get_racing_line(
             ctx: Context,
-            max_points: Annotated[int, Field(ge=1, le=20, description="How many of the next checkpoints to return "
+            max_points: Annotated[int, Field(strict=True, ge=1, le=20, description="How many of the next checkpoints to return "
                                                                       "(1..20).")] = 20
     ) -> dict:
         """The track ahead of your car: the next checkpoints with the racing line point and both track edges.
@@ -659,7 +900,8 @@ def build_server(config, log_level="WARNING"):
         Source: Racing Line packet (id 13) for seat 0 (at the configured rate; needs Driver Data). Points run in
         driving order from the checkpoint the car is heading for; during a pit stop they follow the pit lane.
         Per point: racing_line, left, right ([x, y, z] world metres, as in Motion) and width_m (distance between
-        the edges). car_position_m is the car's current Motion position when available.
+        the edges). car_position_m is the car's position from the newest Motion packet (found through that
+        packet's own seat_car), with car_position_frame_delta = Motion frame minus Racing Line frame.
         """
         got, err = await need(P.PKT_RACING_LINE, 0, what="Racing Line")
         if err:
@@ -673,14 +915,19 @@ def build_server(config, log_level="WARNING"):
         out = base(P.PKT_RACING_LINE, header, age)
         out.update(seat=body["seat"], car=body["car"], points_available=len(body["points"]), points=pts)
         motion = client.latest(P.PKT_MOTION)
-        if motion is not None and body["car"] < len(motion[1]["cars"]):
-            out["car_position_m"] = motion[1]["cars"][body["car"]]["position"]
+        if motion is not None:
+            # the car is found through Motion's own seat_car (indices can move between packets)
+            mcar = motion[0]["seat_car"][body["seat"]] if body["seat"] < 4 else None
+            if mcar is not None and mcar < len(motion[1]["cars"]):
+                out["car_position_m"] = motion[1]["cars"][mcar]["position"]
+                out["car_position_age_s"] = round(motion[2], 2)
+                out["car_position_frame_delta"] = motion[0]["frame"] - header["frame"]
         return clean(out, 2)
 
     @tool(READ)
     async def get_ai_observations(
             ctx: Context, car: CarParam = "me",
-            include_obs: Annotated[bool, Field(description="Include the driving net's input vector (up to 339 "
+            include_obs: Annotated[bool, Field(strict=True, description="Include the driving net's input vector (up to 339 "
                                                           "floats per car; layout belongs to the net, identified "
                                                           "by `policy`). Large; off by default.")] = False
     ) -> dict:
@@ -690,14 +937,35 @@ def build_server(config, log_level="WARNING"):
         switch, off by default, about 1.1 MB/s at 50 Hz; only sent by the machine that simulates the cars:
         single player, splitscreen or the online host). Per car: policy (first 12 hex digits of the net's
         SHA-256), policy_name, obs_frame (advances each time the net decides), action {pedal, steer} the net last
-        chose, obs_count, api_driving, and obs when include_obs is true.
+        chose, obs_count, api_driving, age_s, and obs when include_obs is true. "me" is the newest packet whose
+        own header names its car as seat 0's.
         """
-        if isinstance(car, str) and car.strip().lower() == "all":
-            keys = client.keys(P.PKT_AI_OBSERVATIONS)
+        have = client.keys(P.PKT_AI_OBSERVATIONS)
+        if not have:
+            return await client.no_data_failure(P.PKT_AI_OBSERVATIONS, "AI Observations")
+        packets = {k: client.latest(P.PKT_AI_OBSERVATIONS, k) for k in have}
+        packets = {k: v for k, v in packets.items() if v is not None}
+        ref = min(packets.values(), key=lambda g: g[2]) if packets else None     # the newest packet
+        count = min(ref[0]["num_cars"], P.MAX_CARS) if ref is not None else P.MAX_CARS
+        sel = car.strip().lower() if isinstance(car, str) else car
+        meta = {}
+        wanted = None
+        if sel == "all":
+            keys = have
+        elif sel is None or sel in ME_WORDS:
+            # my car: the newest packet whose own header names its car as seat 0's (T5)
+            mine = sorted((g[2], k) for k, g in packets.items() if g[0]["seat_car"][0] == g[1]["car"])
+            keys = [mine[0][1]] if mine else []
+            wanted = "your car (a packet whose own header names its car as seat 0's)"
         else:
-            keys = select_cars(car, max(client.num_cars, 1))
+            # indices are checked against num_cars of the newest AI Observations packet (V-T9)
+            keys, meta = select_cars(car, count, None)
+            got = packets.get(keys[0])
+            if got is not None and meta.get("selector"):
+                lap = client.latest(P.PKT_LAP_DATA)
+                add_lap_delta(meta, got[0], None if lap is None else lap[0]["frame"])
+            wanted = "car index %d" % keys[0]
         cars = []
-        info = names()
         newest = None
         for key in keys:
             got = client.latest(P.PKT_AI_OBSERVATIONS, key)
@@ -705,32 +973,64 @@ def build_server(config, log_level="WARNING"):
                 continue
             header, body, age = got
             newest = got if newest is None or age < newest[2] else newest
-            row = label(body["car"], info)
-            row.update(age_s=round(age, 2), policy=body["policy"], policy_name=body["policy_name"],
-                       obs_frame=body["obs_frame"], action={"pedal": body["action"][0], "steer": body["action"][1]},
+            row = label(body["car"], names(header))
+            row.update(age_s=round(age, 2), frame=header["frame"], policy=body["policy"],
+                       policy_name=body["policy_name"], obs_frame=body["obs_frame"],
+                       action={"pedal": body["action"][0], "steer": body["action"][1]},
                        obs_count=len(body["obs"]), api_driving=body["api_driving"])
             if include_obs:
                 row["obs"] = clean(body["obs"], 4)
             cars.append(row)
         if not cars:
-            return await client.no_data_failure(P.PKT_AI_OBSERVATIONS, "AI Observations")
+            # packets exist, just not for the car asked for (V-D12): say so, without guessing why
+            return {"ok": False, "error_reason": "no_data",
+                    "explanation": "No AI Observations packet for %s has arrived; packets have arrived for car "
+                                   "indices %s." % (wanted, ", ".join(map(str, sorted(packets)))),
+                    "hint": "The game sends one AI Observations packet per car it simulates, keyed by car index "
+                            "(indices change with race position). Call get_ai_observations with car=\"all\" to see "
+                            "every car that has data.",
+                    "cars_with_data": sorted(packets)}
         out = base(P.PKT_AI_OBSERVATIONS, newest[0], newest[2])
+        out.update(meta)
         out["cars"] = cars
+        out["names_note"] = ("AI Observations come one packet per car, keyed by the car index in each packet; the game "
+                             "re-orders car indices by race position mid-session (seen in 0.88.2), so rows of "
+                             "different ages can belong to cars that have since swapped indices. Compare age_s.")
         return clean(out)
 
     # ================================================================== events
 
-    EventCodes = Annotated[Optional[List[str]], Field(
+    EventCodes = Annotated[Optional[List[SStr]], Field(
         description="Only these event codes (any of SSTA, SEND, CARD, TIRE, LAPC, PITW, PITI, PITO, FINI); "
                     "omit for all.")]
+
+    def check_codes(codes):
+        """Upper-cased codes; ValueError (bad_argument) for anything that is not 4 ASCII characters, and the list
+        of well-formed codes this server does not know (a newer game may add codes, so those are only warned)."""
+        if codes is None:
+            return None, []
+        out = []
+        for code in codes:
+            c = code.strip().upper()
+            if len(c) != 4 or not c.isascii() or not c.isalnum():
+                raise ValueError("event code %r is not a 4-character code; known codes: %s"
+                                 % (code, ", ".join(R.EVENT_INFO)))
+            out.append(c)
+        return out, [c for c in out if c not in R.EVENT_INFO]
+
+    def unknown_codes_warning(out, unknown):
+        if unknown:
+            out["warning"] = ("Unknown event code(s) %s: this server knows %s. A newer game may send them; check the "
+                              "spelling." % (", ".join(unknown), ", ".join(R.EVENT_INFO)))
+        return out
 
     @tool(READ)
     async def get_events(
             ctx: Context,
-            since_seq: Annotated[int, Field(ge=0, description="Return events with seq greater than this "
+            since_seq: Annotated[int, Field(strict=True, ge=0, description="Return events with seq greater than this "
                                                               "(0 = everything buffered).")] = 0,
             codes: EventCodes = None,
-            limit: Annotated[int, Field(ge=1, le=500, description="At most this many (the newest).")] = 50,
+            limit: Annotated[int, Field(strict=True, ge=1, le=500, description="At most this many (the newest).")] = 50,
     ) -> dict:
         """Buffered game events (oldest first), each with a sequence number.
 
@@ -742,6 +1042,7 @@ def build_server(config, log_level="WARNING"):
         `seat` is the local seat (0 = player one) or null for the whole session. Returns events, last_seq (pass
         it as since_seq next time), and buffer_starts_at_seq (older ones were dropped).
         """
+        codes, unknown = check_codes(codes)
         found = client.events_after(since_seq, codes, limit)
         out = {"ok": True, "events": [client.public_event(e) for e in found], "last_seq": client.event_seq,
                "buffer_starts_at_seq": client.oldest_seq()}
@@ -750,27 +1051,30 @@ def build_server(config, log_level="WARNING"):
                 return client.listener_failure()
             out["note"] = ("No events received yet. Events need Decision Events and a running session; "
                            "get_api_status shows the switches.")
-        return out
+        return unknown_codes_warning(out, unknown)
 
     @tool(WAIT)
     async def wait_for_event(
             ctx: Context,
             codes: EventCodes = None,
-            timeout_s: Annotated[float, Field(gt=0, le=WAIT_EVENT_MAX_S, description="How long to wait, seconds "
-                                                                                     "(max 60).")] = 30.0,
-            since_seq: Annotated[Optional[int], Field(ge=0, description="Return events after this seq (an event "
+            timeout_s: Annotated[float, Field(strict=True, gt=0, le=WAIT_EVENT_MAX_S, description="How long to wait, seconds "
+                                                                                     "(max 60; some clients cut a "
+                                                                                     "call at ~80 s).")] = 30.0,
+            since_seq: Annotated[Optional[SInt], Field( ge=0, description="Return events after this seq (an event "
                                                                         "that already arrived counts). Omit to wait "
                                                                         "for events newer than now.")] = None,
     ) -> dict:
         """Block until a matching game event arrives (or timeout_s passes).
 
-        Same events as get_events (needs Decision Events). Typical use: wait_for_event(codes=["TIRE"]) after
-        set_pit(true), to know when the tire screen opens and pick_tire becomes possible. Returns
+        Same events as get_events (needs Decision Events). Not needed for the race loop: wait_for_trigger already
+        wakes on the tire screen (tire_screen trigger) and on card hands. Use it for other events (PITO, LAPC,
+        ...). Codes must be 4 characters; unknown ones give a warning. Returns
         {ok, matched: true, events, last_seq} or {ok, matched: false, last_seq} on timeout. Sends MCP progress
         notifications while waiting. Prefer wait_for_trigger for the main loop.
         """
         if client._tele_transport is None:
             return client.listener_failure()
+        codes, unknown = check_codes(codes)
 
         async def tick(elapsed, total):
             with contextlib.suppress(Exception):
@@ -781,18 +1085,21 @@ def build_server(config, log_level="WARNING"):
         out = {"ok": True, "matched": bool(found), "events": [client.public_event(e) for e in found],
                "last_seq": client.event_seq}
         if not found:
-            out["note"] = "No matching event within %.0f s." % timeout_s
+            out["note"] = "No matching event within %g s." % timeout_s
             if not client.in_session():
                 out["note"] += " No telemetry is arriving (no session, or the game / API is off)."
-        return out
+        return unknown_codes_warning(out, unknown)
 
     # ================================================================== snapshot
 
     def snapshot_context():
-        """Compact race context for trigger results and the snapshot."""
+        """Compact race context for trigger results and the snapshot (G8: laps, points and hand from the trigger
+        engine, so they agree with the triggers)."""
         ctx_out = {}
-        me = client.my_car()
-        ctx_out["my_car"] = me
+        ctx_out["my_car"] = client.my_car()
+        paused = paused_info()
+        if paused:
+            ctx_out["paused"] = paused
         sess = client.latest(P.PKT_SESSION)
         if sess is not None:
             s = sess[1]
@@ -800,30 +1107,59 @@ def build_server(config, log_level="WARNING"):
                                   "weather": s["weather"], "energy_kind": s["energy"],
                                   "public_lobby": s["public_lobby"]}
         lap = client.latest(P.PKT_LAP_DATA)
-        if lap is not None and me is not None and me < len(lap[1]["cars"]):
-            c = lap[1]["cars"][me]
-            ctx_out.update(position=c["position"], laps_completed=c["lap"], gap_to_leader_s=c["gap_to_leader"],
+        lap_me = None if lap is None else lap[0]["seat_car"][0]      # Lap Data's own index of my car
+        if lap is not None and lap_me is not None and lap_me < len(lap[1]["cars"]):
+            cars = lap[1]["cars"]
+            c = cars[lap_me]
+            ctx_out.update(position=c["position"], gap_to_leader_s=c["gap_to_leader"],
                            interval_ahead_s=c["interval_ahead"], interval_behind_s=c["interval_behind"],
                            in_pits=c["in_pits"], finished=c["finished"], pit_stops=c["pit_stops"])
-            order = sorted(range(len(lap[1]["cars"])), key=lambda i: lap[1]["cars"][i]["position"] or 99)
-            info = names()
-            k = order.index(me)
-            if k > 0:
-                ctx_out["car_ahead"] = label(order[k - 1], info)
-            if k + 1 < len(order):
-                ctx_out["car_behind"] = label(order[k + 1], info)
-            ctx_out["cars_in_race"] = len(order)
+            info = names(lap[0])
+            for key, pos in (("car_ahead", (c["position"] or 0) - 1), ("car_behind", (c["position"] or 0) + 1)):
+                found = [i for i, o in enumerate(cars) if pos >= 1 and o["position"] == pos]
+                if found:
+                    row = label(found[0], info)
+                    row.update(selector="ahead" if key == "car_ahead" else "behind", position=pos)
+                    ctx_out[key] = row
+            ctx_out["cars_in_race"] = sum(1 for o in cars if o["position"])
+            ctx_out["lap_data_age_s"] = round(lap[2], 2)
+            if info.note:
+                ctx_out["names_note"] = info.note
+            ctx_out["car_index_note"] = ("car indices are valid for this instant only; use car=\"ahead\" / \"behind\" "
+                                         "in the query tools")
+        laps = engine.laps()
+        ctx_out.update(laps_completed=laps.get("laps_completed"), total_laps=laps.get("total_laps"),
+                       laps_remaining=laps.get("laps_remaining"), lap_source=laps.get("lap_source"))
+        ended = session_ended_info()
+        if ended:
+            ctx_out["session_ended"] = True
+            ctx_out["laps_note"] = "the session has ended: lap values are the state at the end"
+        elif paused:
+            ctx_out["laps_note"] = ("frozen while the game is paused: lap values are the state at the pause "
+                                    "(session_time is not advancing)")
+        lapc = next((e for e in reversed(client.events) if e["code"] == "LAPC" and e["seat"] == 0), None)
+        if lapc is not None:
+            # a timing hint only: the README does not say whether LAPC's lap is laps completed or the new lap
+            ctx_out["last_lap_event"] = {"lap": lapc.get("lap"), "position": lapc.get("position"),
+                                         "age_s": round(time.monotonic() - lapc["_received"], 1)}
+        cs = engine.card_state()
+        ctx_out["points"] = current_points(cs)
+        ctx_out["cards_open"] = cs.get("open")
+        for key in ("player_data_older_than_trigger",):
+            if cs.get(key):
+                ctx_out[key] = cs[key]
         pl = client.latest(P.PKT_PLAYER, 0)
         if pl is not None:
             b = pl[1]
-            ctx_out.update(laps_remaining=b["laps_remaining"], points=b["points"],
-                           tire={"compound": b["tire_compound"], "health": b["tire_health"],
+            ctx_out.update(tire={"compound": b["tire_compound"], "health": b["tire_health"],
                                  "puncture": b["puncture"]},
                            energy=b["energy"], pit_planned=b["pit_planned"], can_pit=b["can_pit"])
+            ctx_out["player_data_age_s"] = round(pl[2], 2)
         else:
             tel = client.latest(P.PKT_CAR_TELEMETRY)
-            if tel is not None and me is not None and me < len(tel[1]["cars"]):
-                c = tel[1]["cars"][me]
+            tme = None if tel is None else tel[0]["seat_car"][0]
+            if tel is not None and tme is not None and tme < len(tel[1]["cars"]):
+                c = tel[1]["cars"][tme]
                 ctx_out.update(tire={"compound": c["tire_compound"], "health": c["tire_health"],
                                      "puncture": c["puncture"]}, energy=c["energy"])
         age = client.telemetry_age()
@@ -832,14 +1168,16 @@ def build_server(config, log_level="WARNING"):
 
     @tool(READ)
     async def get_race_snapshot(ctx: Context) -> dict:
-        """One compact overview of the race for your car: session, position, gaps, tires, energy, decisions.
+        """One compact overview of the race for your car: session, position, gaps, laps, tires, energy, decisions.
 
-        Combines Session, Lap Data, Participants, Player and Car Telemetry (whichever are switched on): session
-        type/scene/total_laps/weather/energy_kind, position, laps_completed, laps_remaining, gaps (seconds; see
-        get_standings about interval_behind's sign), car_ahead / car_behind (car index, name), tire (compound,
-        health 1..0, puncture), energy (0..1), points, pit_planned, can_pit, in_pits; plus pending decisions
-        (cards on offer, open tire screen), the tire-wear forecast of the trigger engine, undelivered triggers
-        and running boost/drive holds.
+        Combines Session, Lap Data, Participants, Player and Car Telemetry (whichever are switched on) with the
+        trigger engine's state: session type/scene/total_laps/weather/energy_kind, position, gaps (seconds; see
+        get_standings about interval_behind's sign), laps_completed / total_laps / laps_remaining with lap_source
+        and lap_data_age_s (labelled frozen while the game is paused), car_ahead / car_behind (car index valid for
+        this instant only, name when known, selector "ahead" / "behind" to use with the query tools), tire
+        (compound, health 1..0, puncture), energy (0..1), points, pit_planned, can_pit, in_pits; plus the open
+        decisions (card hand, tire screen), the tire-wear forecast of the trigger engine, paused, and running
+        boost/drive holds.
         """
         if client._tele_transport is None:
             return client.listener_failure()
@@ -848,13 +1186,14 @@ def build_server(config, log_level="WARNING"):
             return await client.no_data_failure(P.PKT_SESSION, "race")
         out = {"ok": True}
         out.update(snapshot_context())
-        pl = client.latest(P.PKT_PLAYER, 0)
-        if pl is not None and pl[1]["points"] > 0 and pl[1]["hand"]:
-            out["cards_on_offer"] = pl[1]["hand"]
-        if client.tire_event is not None:
-            out["tire_screen_open"] = client.public_event(client.tire_event)
-        out["tire_forecast"] = clean(client.triggers.tire_prediction())
-        out["undelivered_triggers"] = len(client.triggers.pending()[0])
+        cs = engine.card_state()
+        if cs.get("open") is not False and cs.get("hand"):
+            out["cards_on_offer"] = {"open": cs.get("open"), "hand": cs.get("hand"), "seq": cs.get("seq")}
+        ts = engine.tire_state()
+        if ts.get("open"):
+            out["tire_screen_open"] = ts
+        out["open_decisions"] = open_decisions()
+        out["tire_forecast"] = clean(engine.tire_prediction())
         holds = client.hold_status()
         if holds:
             out["holds"] = holds
@@ -862,10 +1201,10 @@ def build_server(config, log_level="WARNING"):
 
     # ================================================================== reference
 
-    @tool(READ)
+    @tool(READ_LOCAL)
     async def get_reference(
             ctx: Context,
-            topic: Annotated[str, Field(description="One of: all, " + ", ".join(R.TOPICS)
+            topic: Annotated[str, Field(strict=True, description="One of: all, " + ", ".join(R.TOPICS)
                                                     + ". Aliases: errors, events, cameras, tires, cards, "
                                                       "switches.")] = "all"
     ) -> dict:
@@ -875,7 +1214,8 @@ def build_server(config, log_level="WARNING"):
         participant_kinds, error_reasons (every refusal reason with explanation and what to do), event_codes,
         packets (id, size, rate, needed switch), commands (id, size, payload, needed switch, reply), settings
         (in-game switches and which tools need them), rules (seat rule, public lobby, holds, drive
-        consequences), triggers (what fires each trigger, the switches it needs, which are heuristic). Also
+        consequences), triggers (what fires each trigger, the switches it needs, which are heuristic), observed
+        (behaviour seen against the live game, 0.88.2, that the README does not state or contradicts). Also
         available as resources bc://reference/{topic}.
         """
         try:
@@ -885,180 +1225,305 @@ def build_server(config, log_level="WARNING"):
 
     # ================================================================== triggers
 
+    active_waits = []        # one record per running wait_for_trigger call (concurrent calls share new entries)
+
+    def _wait_note(entries):
+        types = [e.get("type") for e in entries]
+        if "card_offer" in types and any(e.get("type") == "tire_screen" and e.get("open") for e in entries):
+            return ("tire screen open in the pit lane: pick_tire before pick_card (a pick was seen refused with "
+                    "cards_unavailable while the tire screen was open, 0.88.2); the hand stays open")
+        return None
+
     @tool(WAIT)
     async def wait_for_trigger(
             ctx: Context,
-            timeout_s: Annotated[Optional[float], Field(
-                gt=0, description="Longest wait in seconds; default and maximum are BC_WAIT_MAX_S (300 unless "
-                                  "configured). Your MCP client's own tool timeout may be lower (Claude Code: "
-                                  "MCP_TOOL_TIMEOUT); keep timeout_s below it.")] = None,
-            since_seq: Annotated[Optional[int], Field(
-                ge=0, description="Return triggers with seq greater than this. Omit to get every trigger not yet "
-                                  "returned by wait_for_trigger (the normal loop).")] = None,
+            timeout_s: Annotated[Optional[SFloat], Field(
+                gt=0, description="Longest wait in seconds; default 55, never more than 60 (BC_WAIT_MAX_S can only "
+                                  "lower it). Some MCP clients (the Claude desktop app's device bridge) cut a call at "
+                                  "about 80 s and its result is lost.")] = None,
+            since_seq: Annotated[Optional[SInt], Field(
+                ge=0, description="Acknowledge: the last_seq of the previous result, passed after you acted on it. "
+                                  "Triggers up to it are not returned again; anything after it is (a result your "
+                                  "client lost is returned again). Omit if you lost track.")] = None,
     ) -> dict:
         """Block until the race needs a decision from you; this is the main loop of the race engineer.
 
-        Returns immediately if a trigger is already queued and not yet delivered. Enabled triggers (BC_TRIGGERS;
-        default card_offer, car_damaged, tires_wont_last; optional tire_screen):
-        - card_offer: a new hand of upgrade cards (points, hand with index/upgrade/facility/tier/banned,
-          ban_tokens). From the CARD event, or from the Player packet when Decision Events is off. Answer with
-          pick_card(index) / ban_card(index).
-        - car_damaged: signal "puncture" (definite: the puncture flag went 0 -> 1) or "performance_drop"
-          (heuristic: one performance area of your car fell suddenly while the field's did not and no ability
-          was active; heuristic=true). Consider set_pit(true).
-        - tires_wont_last (heuristic forecast): tire health is predicted to fall to BC_TIRE_MARGIN (0.05) or below
-          by the end of the NEXT lap, or is already at/below BC_TIRE_FLOOR (0.10). Payload: tire_health,
-          wear_per_lap and how it was derived, predicted_health_end_of_next_lap, laps_remaining, can_pit,
-          pit_planned, compound, compound_picks_left, pit_lane_time_loss_s. Silent on the last lap, in the pit
-          lane, after the flag or when a stop is already called. Decide set_pit(true), then pick_tire when the
-          tire screen opens.
+        Returns at once when a trigger is due, else blocks until one is (or timeout_s). Delivery is at least
+        once: a trigger after since_seq that was returned before comes back (resent: true) at most every 20 s,
+        up to 3 more times while it is an open decision (card hand, tire screen), once for other types when
+        since_seq is passed. Answered, closed, superseded (a newer hand, the car pitted since) and old-session
+        entries are not returned; `skipped` counts them. Enabled triggers (BC_TRIGGERS; default all four):
+        - card_offer: a new hand of upgrade cards (seq, points, hand with index/upgrade/facility/tier/banned,
+          ban_tokens, in_pits, open). From the CARD event; from the Player packet when Decision Events is off,
+          and also with it on when no CARD event announced a hand the Player packet shows for 2 s.
+          Answer at once with pick_card(index, seq) (ban_card(index, seq) first if wanted): the game stops time
+          while a hand waits. In the pit lane a pick was seen refused with cards_unavailable (0.88.2): pick the
+          tire first; the hand stays open.
         - tire_screen: the tire selection screen opened (pre_race, current, allowed, picks_left): pick_tire.
-        Result when triggered: {triggered: true, triggers: [{seq, type, age_s, superseded, lap, ...payload}],
-        context: {position, laps_completed, laps_remaining, gaps, car_ahead/behind, tire, energy, points, ...}}.
-        Older triggers can be superseded (a newer hand, or the car pitted since): act on the newest.
-        On SEND/FINI (session over / you took the flag) it returns {triggered: false, status: "session_ended"}.
-        On timeout {triggered: false, status: "timeout", ...}: just call it again. Sends MCP progress
-        notifications while waiting. The server never acts by itself: nothing happens unless you call a command.
+        - car_damaged: signal "puncture" (definite: two consecutive samples show the puncture flag) or
+          "performance_drop"
+          (heuristic: performance areas of your car fell suddenly while the field's did not and no ability was
+          active; heuristic=true). Payload includes can_pit, pit_planned, in_pits, laps_remaining.
+        - tires_wont_last (heuristic forecast): tire health is predicted to fall to BC_TIRE_MARGIN (0.05) or below
+          by the end of the NEXT lap (or is at/below BC_TIRE_FLOOR when there is no forecast). Payload:
+          tire_health, wear_per_lap and how it was derived, predicted_health_end_of_next_lap, laps_remaining,
+          can_pit, pit_planned, compound, compound_picks_left, pit_lane_time_loss_s. Silent on the last lap, in
+          the pit lane, after the flag or when a stop is already called.
+        - session_ended: the session is over for you (SEND, or FINI for seat 0; code, position); one per session,
+          kept even when the next session starts first.
+        Result: {status: "triggered" | "session_ended" | "timeout", triggered, triggers: [{seq, type, age_s,
+        resent, open, lap, ...payload}] oldest first, last_seq (pass it as since_seq next time, after acting),
+        skipped, open_decisions (the open card hand / tire screen right now, on every result), context (position,
+        laps, gaps, car_ahead/behind, tire, energy, points, paused, ...), notes}. Sends MCP progress
+        notifications while waiting. The server never sends a gameplay command on its own (only the read-only
+        hello): nothing happens unless you call a command.
         """
         if client._tele_transport is None:
             return client.listener_failure()
-        cap = config.wait_max_s
+        cap = min(float(config.wait_max_s or WAIT_HARD_MAX_S), WAIT_HARD_MAX_S)
         timeout = cap if timeout_s is None else min(timeout_s, cap)
-        engine = client.triggers
+        loop = asyncio.get_running_loop()
+        me = {"mailbox": [], "wake": loop.create_future()}
+        active_waits.append(me)
         start = time.monotonic()
         deadline = start + timeout
         last_progress = start
-        while True:
-            trig, end = engine.pending(since_seq)
-            if trig or end:
-                engine.mark_delivered(trig, end)
+        skipped = {}
+        notes = []
+        acked = None
+        ack = since_seq
+        try:
+            while True:
                 now = time.monotonic()
-                out = {"ok": True, "triggered": bool(trig)}
-                if trig:
-                    out["triggers"] = [clean(engine.public(t, now)) for t in trig]
-                if end:
-                    out["status"] = "session_ended"
-                    out["session_end"] = engine.end_info
-                    out["next"] = ("The session is over for you. Call wait_for_trigger again to wait for the next "
-                                   "session's triggers.")
-                out["context"] = snapshot_context()
-                out["last_seq"] = engine.seq
-                return out
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            fut = engine.waiter()
-            try:
-                await asyncio.wait_for(fut, min(remaining, PROGRESS_INTERVAL_S))
-            except asyncio.TimeoutError:
-                pass
-            finally:
-                engine.discard_waiter(fut)
-            now = time.monotonic()
-            if now - last_progress >= PROGRESS_INTERVAL_S * 0.99 and now < deadline:
-                last_progress = now
-                with contextlib.suppress(Exception):
-                    await ctx.report_progress(round(now - start, 1), round(timeout, 1), "waiting for a trigger")
-        out = {"ok": True, "triggered": False, "status": "timeout", "waited_s": round(time.monotonic() - start, 1),
-               "last_seq": engine.seq, "context": snapshot_context(),
-               "next": "Nothing needed a decision. Call wait_for_trigger again."}
+                r = engine.collect(ack, now)
+                ack = None                       # the acknowledgement is applied once per call
+                acked = r.get("last_seq", r.get("acked", acked))
+                for k, v in (r.get("skipped") or {}).items():
+                    skipped[k] = skipped.get(k, 0) + (v or 0)
+                for n in r.get("notes") or []:
+                    if n not in notes:
+                        notes.append(n)
+                entries = list(r.get("entries") or [])
+                if entries:
+                    for other in active_waits:   # a concurrent wait gets the same new entries
+                        if other is not me:
+                            other["mailbox"].extend(dict(e) for e in entries)
+                            if not other["wake"].done():
+                                other["wake"].set_result(None)
+                elif me["mailbox"]:
+                    entries = me["mailbox"]
+                if entries:
+                    seen = set()
+                    unique = []
+                    for e in sorted(entries, key=lambda e: e["seq"]):
+                        if e["seq"] not in seen:
+                            seen.add(e["seq"])
+                            unique.append(e)
+                    return trigger_result(unique, r, skipped, notes, start)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                wait = min(remaining, PROGRESS_INTERVAL_S)
+                due = engine.next_due_in(time.monotonic())
+                if due is not None:
+                    wait = min(wait, max(due, 0.0) + 0.01)
+                fut = engine.waiter()
+                if me["wake"].done():
+                    me["wake"] = loop.create_future()
+                try:
+                    await asyncio.wait({fut, me["wake"]}, timeout=wait, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    engine.discard_waiter(fut)
+                    if not fut.done():
+                        fut.cancel()
+                now = time.monotonic()
+                if now - last_progress >= PROGRESS_INTERVAL_S * 0.99 and now < deadline:
+                    last_progress = now
+                    with contextlib.suppress(Exception):
+                        await ctx.report_progress(round(now - start, 1), round(timeout, 1), "waiting for a trigger")
+        finally:
+            active_waits.remove(me)
+        out = {"ok": True, "status": "timeout", "triggered": False, "triggers": [],
+               "waited_s": round(time.monotonic() - start, 1),
+               "last_seq": acked if acked is not None else getattr(engine, "acked", 0),
+               "skipped": skipped, "open_decisions": open_decisions()}
+        paused = paused_info()
+        if paused:
+            out["paused"] = paused
+        if notes:
+            out["notes"] = notes
+        out["context"] = snapshot_context()
+        out["next"] = ("Nothing new needed a decision. If open_decisions is not empty, answer it now; then call "
+                       "wait_for_trigger again with since_seq = last_seq.")
         if not client.in_session():
             out["telemetry"] = ("No telemetry is arriving: the game sends none outside a session, or the API / "
                                 "its switches are off (see get_api_status).")
         return out
 
+    def trigger_result(entries, r, skipped, notes, start):
+        now = time.monotonic()
+        rows = [clean(e) for e in entries]
+        ended = [e for e in rows if e.get("type") == "session_ended"]
+        status = r.get("status") if r.get("entries") else None
+        if status not in ("triggered", "session_ended"):
+            status = "session_ended" if rows and rows[-1].get("type") == "session_ended" else "triggered"
+        if r.get("entries"):
+            # the engine's cursor: it never jumps over an earlier returned entry still waiting for its resend
+            last = r.get("last_seq") or 0
+        else:                            # entries handed over by a concurrent wait (they were returned there)
+            last = max([r.get("last_seq") or 0] + [e["seq"] for e in rows])
+        out = {"ok": True, "status": status, "triggered": any(e.get("type") != "session_ended" for e in rows),
+               "triggers": rows, "last_seq": last, "skipped": skipped, "open_decisions": open_decisions(),
+               "waited_s": round(now - start, 1)}
+        note = _wait_note(rows)
+        if note:
+            notes = notes + [note]
+        if any(e.get("resent") for e in rows):
+            notes = notes + ["Entries marked resent were returned before and are not acknowledged; a decision "
+                             "still open (open: true or null) needs an answer now."]
+        if notes:
+            out["notes"] = notes
+        if ended:
+            out["session_end"] = ended[-1]
+            out["next"] = ("The session is over for you: summarise it. Call wait_for_trigger again (since_seq = "
+                           "last_seq) only to wait for the next session.")
+        out["context"] = snapshot_context()
+        return out
+
     @tool(READ)
     async def get_triggers(
             ctx: Context,
-            since_seq: Annotated[int, Field(ge=0, description="Triggers with seq greater than this.")] = 0,
-            limit: Annotated[int, Field(ge=1, le=200, description="At most this many (the newest).")] = 20,
+            since_seq: Annotated[int, Field(strict=True, ge=0, description="Triggers with seq greater than this.")] = 0,
+            limit: Annotated[int, Field(strict=True, ge=1, le=200, description="At most this many (the newest).")] = 20,
     ) -> dict:
-        """Recent triggers of the current session, without waiting and without marking them delivered.
+        """Recent triggers kept by the server, without waiting and without changing what wait_for_trigger returns.
 
-        Includes delivered and undelivered ones. Each: seq, type (card_offer, car_damaged, tires_wont_last, tire_screen), age_s, superseded, lap,
-        session_time_s and the payload described in wait_for_trigger. The queue is cleared when a new session
-        starts (sequence numbers keep increasing). Also: last_seq, delivered_up_to_seq.
+        Each: seq, type (card_offer, car_damaged, tires_wont_last, tire_screen, session_ended), age_s, superseded,
+        open (decisions: true / false / null = unknown), lap, session_time_s and the payload described in
+        wait_for_trigger. Entries of an earlier session are kept (marked stale_session) until the queue's size
+        limit; sequence numbers only increase within this server process. Also: last_seq, acked_up_to_seq (the
+        highest since_seq passed to wait_for_trigger), open_decisions.
         """
-        engine = client.triggers
         now = time.monotonic()
-        return {"ok": True, "triggers": [clean(engine.public(t, now)) for t in engine.after(since_seq, limit)],
-                "last_seq": engine.seq, "delivered_up_to_seq": engine.delivered_seq}
+        found = [e for e in engine.triggers if e["seq"] > since_seq][-limit:]
+        return {"ok": True, "triggers": [clean(engine.public(e, now)) for e in found],
+                "last_seq": engine.seq, "acked_up_to_seq": getattr(engine, "acked", None),
+                "open_decisions": open_decisions()}
 
-    @tool(READ)
+    @tool(READ_LOCAL)
     async def get_trigger_config(ctx: Context) -> dict:
         """The trigger engine's configuration and live state, to judge how much to trust a trigger.
 
         Returns enabled triggers, thresholds (tire_margin, tire_floor, perf_drop, perf_window_s; all tunable
         heuristics of this server, not game values) and state: which source card offers come from (CARD event or
-        Player fallback), the last card offer, puncture flag and arming, alarmed performance areas, and the tire
-        forecast (current health, per-lap wear samples on this tire set, wear_per_lap and how it was derived, lap
-        time and its source, predicted health at the end of the next lap, armed / silenced reason).
+        Player fallback), the card and tire-screen state, puncture flag and arming, alarmed performance areas,
+        the lap count and its source with the last lap observations (LAPC lap vs Lap Data vs Player, to settle
+        what LAPC's lap means), and the tire forecast (current health, per-lap wear samples on this tire set,
+        wear_per_lap and how it was derived, lap time and its source, predicted health at the end of the next
+        lap, armed / silenced reason; the floor only fires when there is no forecast).
         """
         out = {"ok": True}
         out.update(config.triggers.public())
-        out["state"] = clean(client.triggers.state(), 4)
+        out["state"] = clean(engine.state(), 4)
+        out["laps"] = clean(engine.laps(), 4)
         return out
 
     # ================================================================== commands
 
+    CARD_SEQ_DESC = ("The seq of the card_offer trigger you are answering (optional). If the hand on offer is no "
+                     "longer that trigger's hand, the command is refused with hand_changed and the current hand is "
+                     "returned, so a stale index never picks the wrong card.")
+    CARDS_UNAVAILABLE_HINT = ("Seen in 0.88.2 in the pit lane: pick_tire first (if the tire screen is open) or retry "
+                              "after the car leaves the pit lane (PITO). The hand stays open.")
+
+    def check_hand(seq, command):
+        """None when the pick / ban may go ahead, else the hand_changed refusal (X11)."""
+        if seq is None:
+            return None
+        cs = engine.card_state()
+        want = engine.hand_sig_for_seq(seq)
+        if want is not None and cs.get("sig") == want:
+            return None
+        why = ("(trigger %d is not a card_offer this server knows)" % seq if want is None
+               else "(the hand on offer is not the hand of trigger %d)" % seq)
+        return failure("hand_changed", command, why,
+                       current_hand={k: cs.get(k) for k in ("open", "points", "hand", "seq", "in_pits")})
+
     @tool(_write(True, False, "Pick an upgrade card"))
     async def pick_card(
             ctx: Context,
-            index: Annotated[int, Field(ge=0, le=3, description="Card index in the current hand, 0..3 (the `index` "
+            index: Annotated[int, Field(strict=True, ge=0, le=3, description="Card index in the current hand, 0..3 (the `index` "
                                                                 "field of the hand in the card_offer trigger, "
                                                                 "get_pending_decisions or get_player_state).")],
+            seq: Annotated[Optional[SInt], Field(ge=0, description=CARD_SEQ_DESC)] = None,
     ) -> dict:
         """Pick a card from the hand on offer, spending one upgrade point (command pick_card, id 2, seat 0).
 
-        Needs Player Input, points > 0 and a card that is not banned. The game answers Ack or Error; possible
-        errors: no_points, invalid_index, cards_unavailable, card_banned, input_disabled, public_lobby, no_player.
+        Pass seq (the card_offer trigger's seq) so a hand that changed meanwhile is refused with hand_changed
+        (the current hand is returned) instead of picking whatever card now has that index. Needs Player Input,
+        points > 0 and a card that is not banned. The game answers Ack or Error; possible errors: no_points,
+        invalid_index, cards_unavailable (observed in 0.88.2 while the car was in the pit lane with a hand on
+        offer: pick the tire first or retry after the pit lane; the hand stays open), card_banned,
+        input_disabled, public_lobby, no_player. The game stops time while a hand waits, so answer promptly. On
+        no_reply the outcome is unknown: check get_pending_decisions before retrying.
         Returns {ok, picked: the card as last seen in the hand (when known)} or {ok: false, error_reason,
         explanation, hint}. After a pick the game may offer a new hand (a new card_offer trigger) while points
         remain.
         """
+        refused = check_hand(seq, "pick_card")
+        if refused:
+            return refused
         card = None
-        got = client.latest(P.PKT_PLAYER, 0)
-        hand = got[1]["hand"] if got is not None else (client.card_event or {}).get("hand", [])
-        for c in hand or []:
-            if c["index"] == index:
+        hand = engine.card_state().get("hand") or []
+        for c in hand:
+            if c.get("index") == index:
                 card = c
         result = await client.pick_card(index)
+        engine.answer_card(result)
         if result["ok"] and card is not None:
             result["picked"] = card
+        if result.get("error_reason") == "cards_unavailable":
+            result["hint"] = CARDS_UNAVAILABLE_HINT
+            result["hand_still_open"] = True
         return result
 
     @tool(_write(True, False, "Ban an upgrade card"))
     async def ban_card(
             ctx: Context,
-            index: Annotated[int, Field(ge=0, le=3, description="Card index in the current hand, 0..3.")],
+            index: Annotated[int, Field(strict=True, ge=0, le=3, description="Card index in the current hand, 0..3.")],
+            seq: Annotated[Optional[SInt], Field(ge=0, description=CARD_SEQ_DESC)] = None,
     ) -> dict:
         """Ban a card in the current hand, spending one ban token (command ban_card, id 7, seat 0).
 
         This is the card screen's own ban. Unlike a pick it keeps your turn: you still have to pick a card. It
-        cannot ban the last card left to pick. Needs Player Input. Errors: ban_refused (no ban tokens left, last
-        card left to pick, or a card that can't be banned), invalid_index, input_disabled, public_lobby,
-        no_player. Ban tokens left: get_car_abilities / get_pending_decisions (ban_tokens).
+        cannot ban the last card left to pick. Pass seq (the card_offer trigger's seq) to be refused with
+        hand_changed if the hand changed. Needs Player Input. Errors: ban_refused (no ban tokens left, last card
+        left to pick, or a card that can't be banned), invalid_index, input_disabled, public_lobby, no_player.
+        Ban tokens left: get_car_abilities / get_pending_decisions (ban_tokens).
         """
+        refused = check_hand(seq, "ban_card")
+        if refused:
+            return refused
         return await client.ban_card(index)
 
-    @tool(_write(False, True, "Call or cancel a pit stop"))
+    @tool(_write(True, True, "Call or cancel a pit stop"))
     async def set_pit(
             ctx: Context,
-            pit: Annotated[bool, Field(description="true calls a pit stop, false cancels a called one.")],
+            pit: Annotated[bool, Field(strict=True, description="true calls a pit stop, false cancels a called one.")],
     ) -> dict:
         """Call (true) or cancel (false) a pit stop for your car (command set_pit, id 3, seat 0).
 
         Needs Player Input. Check can_call_now (get_player_state) / can_pit (trigger payload or PITW event)
         first: a call the car can't make is refused with `refused`. Other errors: input_disabled, public_lobby,
-        no_player. When the car enters the pits the tire screen opens (TIRE event): then use pick_tire. The game
-        does not document what it fits if no compound is picked.
+        no_player. When the car enters the pits the tire screen opens (a tire_screen trigger from
+        wait_for_trigger): then use pick_tire. The game does not document what it fits if no compound is picked.
         """
         return await client.set_pit(pit)
 
     @tool(_write(True, False, "Pick a tire compound"))
     async def pick_tire(
             ctx: Context,
-            compound: Annotated[Union[str, int], Field(
+            compound: Annotated[Union[SStr, SInt], Field(
                 description="Compound name (case-insensitive): Standard, Boost, Experimental, Fast, Durable, Wet, "
                             "Golden; or its index 0..6.")],
     ) -> dict:
@@ -1066,7 +1531,7 @@ def build_server(config, log_level="WARNING"):
 
         The tire screen opens on the starting grid, in the qualifying box and at a pit stop (TIRE event: its
         `allowed` list and `picks_left` say what can be chosen; null = no limit). Needs Player Input and an open
-        tire screen. Errors: tire_select_closed (screen not open: wait_for_event(codes=["TIRE"])),
+        tire screen. Errors: tire_select_closed (screen not open: wait for the tire_screen trigger),
         compound_refused (not allowed now / no picks left), invalid_compound, input_disabled, public_lobby.
         """
         try:
@@ -1074,19 +1539,21 @@ def build_server(config, log_level="WARNING"):
         except ValueError as e:
             return failure("bad_argument", "pick_tire", "(%s)" % e)
         result = await client.pick_tire(index)
+        engine.answer_tire(result)
         result["compound"] = P.COMPOUNDS[index]
         return result
 
-    @tool(_write(False, False, "Hold boost buttons"))
+    @tool(_write(True, False, "Hold boost buttons (spends energy)"))
     async def boost(
             ctx: Context,
-            speed: Annotated[bool, Field(description="Hold the speed boost button.")] = False,
-            cornering: Annotated[bool, Field(description="Hold the cornering boost button. With speed this becomes "
+            speed: Annotated[bool, Field(strict=True, description="Hold the speed boost button.")] = False,
+            cornering: Annotated[bool, Field(strict=True, description="Hold the cornering boost button. With speed this becomes "
                                                          "a super boost once the car has unlocked it.")] = False,
-            party_mode: Annotated[bool, Field(description="Hold party mode (only exists in fuel races, once "
+            party_mode: Annotated[bool, Field(strict=True, description="Hold party mode (only exists in fuel races, once "
                                                           "unlocked).")] = False,
-            duration_s: Annotated[float, Field(gt=0, le=MAX_BOOST_S, description="How long to hold, seconds "
-                                                                                 "(max 30).")] = 2.0,
+            duration_s: Annotated[float, Field(strict=True, ge=MIN_HOLD_S, le=MAX_BOOST_S,
+                                               description="How long to hold, seconds (0.05..30; a shorter hold "
+                                                           "would send no command).")] = 2.0,
     ) -> dict:
         """Hold boost buttons for duration_s seconds (command boost, id 8, seat 0, re-sent at 50 Hz).
 
@@ -1118,7 +1585,7 @@ def build_server(config, log_level="WARNING"):
     @tool(_write(False, False, "Change camera"))
     async def set_camera(
             ctx: Context,
-            camera: Annotated[Union[str, int], Field(
+            camera: Annotated[Union[SStr, SInt], Field(
                 description="Camera name (case-insensitive): Helicopter, TrackSide, Drone, Onboard_TCam, "
                             "Onboard_Rear, Onboard_Front, Onboard_Driver, Onboard_TVAngle, Chase, Onboard_BattleCam "
                             "(TrackOverview is not offered in races); or next, previous, automatic; or an index "
@@ -1144,10 +1611,11 @@ def build_server(config, log_level="WARNING"):
         @tool(_write(True, False, "Drive the car (withholds achievements)"))
         async def drive(
                 ctx: Context,
-                pedal: Annotated[float, Field(ge=-1.0, le=1.0, description="-1 full brake to 1 full throttle.")],
-                steer: Annotated[float, Field(ge=-1.0, le=1.0, description="-1 full left to 1 full right.")],
-                duration_s: Annotated[float, Field(gt=0, le=MAX_DRIVE_S, description="How long to hold, seconds "
-                                                                                    "(max 10).")] = 1.0,
+                pedal: Annotated[float, Field(strict=True, ge=-1.0, le=1.0, description="-1 full brake to 1 full throttle.")],
+                steer: Annotated[float, Field(strict=True, ge=-1.0, le=1.0, description="-1 full left to 1 full right.")],
+                duration_s: Annotated[float, Field(strict=True, ge=MIN_HOLD_S, le=MAX_DRIVE_S,
+                                                   description="How long to hold, seconds (0.05..10; a shorter "
+                                                               "hold would send no command).")] = 1.0,
         ) -> dict:
             """Take over pedal and steering of your car for duration_s seconds (command drive, id 5, 50 Hz).
 
@@ -1175,78 +1643,65 @@ def build_server(config, log_level="WARNING"):
     if state.results is not None:
         store = state.results.store
 
+        def results_failure(e):
+            out = failure(getattr(e, "reason", "stored_file_unreadable"), detail="(%s)" % getattr(e, "explanation", e))
+            out.update({k: v for k, v in (getattr(e, "details", None) or {}).items() if k not in out})
+            return out
+
         @tool(READ)
         async def list_race_results(
                 ctx: Context,
-                limit: Annotated[int, Field(ge=1, le=200, description="At most this many, newest first.")] = 20,
+                limit: Annotated[int, Field(strict=True, ge=1, le=200, description="At most this many, newest first.")] = 20,
         ) -> dict:
             """Race weekends the game uploaded to this server's results receiver, newest first.
 
             The game uploads a finished race weekend only when you host and http://127.0.0.1:<BC_RESULTS_PORT>/
             (with BC_RESULTS_TOKEN as its token, if set) is listed under Race Results in Settings > Telemetry.
-            Nothing is retried by the game. Per upload: id (use with get_race_result), received (local time),
-            bytes, game_version, session_count, and problems if the document looked malformed.
+            Nothing is retried by the game, and the receiver only runs while this server runs. At most
+            BC_RESULTS_KEEP uploads (default 100) are kept; this lists the newest `limit` (max 200). Per upload: id
+            (a UTC time; use with get_race_result), received_utc (when this server saved it), bytes, compressed /
+            stored_as (json, or zip: the body is stored as received), and from the upload's X-BC-* headers (not
+            the document): format, game_version, session_count (integer); problems (empty, or why the document
+            looked malformed or has a format other than 2).
             """
-            out = {"ok": True, "receiver": state.results.status(), "results": []}
-            for rid in store.ids()[:limit]:
-                headers = store.load_headers(rid)        # not the document: it can be up to 256 MB
-                entry = {"id": rid, "bytes": store.size(rid),
-                         "game_version": headers.get("x-bc-game-version"),
-                         "session_count": headers.get("x-bc-session-count")}
-                if headers.get("problems"):
-                    entry["problems"] = headers["problems"]
-                out["results"].append(entry)
-            return out
+            try:
+                results = await asyncio.to_thread(store.list, limit)
+            except ResultsError as e:
+                return results_failure(e)
+            return {"ok": True, "receiver": state.results.status(), "results": results}
 
         @tool(READ)
         async def get_race_result(
                 ctx: Context,
-                result_id: Annotated[str, Field(description='An id from list_race_results, or "latest".')] = "latest",
-                include_decisions: Annotated[bool, Field(description="Include the decision log entries (without "
-                                                                      "their feature vectors).")] = False,
-                max_decisions: Annotated[int, Field(ge=1, le=1000, description="Decision entries per session when "
+                result_id: Annotated[str, Field(strict=True, description='An id from list_race_results, or "latest".')] = "latest",
+                include_decisions: Annotated[bool, Field(strict=True, description="Include the decision log entries (without "
+                                                                      "their state and offered feature vectors).")] = False,
+                max_decisions: Annotated[int, Field(strict=True, ge=1, le=1000, description="Decision entries per session when "
                                                                                "included.")] = 50,
+                include_steam_ids: Annotated[bool, Field(strict=True, description="Include host_steam_id and each "
+                                                                      "classification row's steam_id (SteamID64 as a "
+                                                                      "string). Off by default: personal "
+                                                                      "identifiers.")] = False,
         ) -> dict:
             """One uploaded race weekend: per session the classification, plus a summary of the decision log.
 
-            Document format 2 (schema/race-results in the game's GameAPI folder). Per session: kind (qualifying /
-            race), track, started_at / ended_at (Unix ms), classification (position, class_position, car_id,
-            car_number, car_class, name, driver human/ai, local_seat, grid, laps, gap_to_leader_s, best_lap_s;
-            steam ids are left out), decisions_count by decision_type (card, pit, tire) and chosen_by. A pick made by
-            hand is not logged by the game; whether API picks count as by hand is not documented.
+            Document format 2 only (schema/race-results in the game's GameAPI folder); another format is refused
+            with unsupported_format, an unreadable stored file with stored_file_unreadable. Top level: format,
+            game_version, unity_version, schema_version, schema_hash, timepoint (Unix ms), editor, demo,
+            public_lobby (host_steam_id only with include_steam_ids). Per session: kind (qualifying / race), track,
+            started_at / ended_at (Unix ms), race_id, header (the decision log's session header, or null),
+            classification as uploaded (position, class_position, car_id, car_number, car_class, name, driver
+            human/ai, local_seat, grid, laps, gap_to_leader_s, best_lap_s; steam_id only with include_steam_ids),
+            decisions_count and decisions_by_type ("<decision_type>/<chosen_by>"); with include_decisions the
+            entries without their state and offered vectors. Numbers are not rounded (only NaN/inf become null).
+            A pick made by hand is not logged by the game; whether API picks count as by hand is not documented.
             """
-            rid = store.resolve(result_id)
-            if rid is None:
-                return failure("bad_argument", detail="(no stored upload %r; see list_race_results)" % result_id)
-            # parsing up to 256 MB of JSON must not stall the telemetry listener and the event loop
-            document, headers = await asyncio.to_thread(store.load, rid)
-            if not isinstance(document, dict):
-                return failure("bad_argument", detail="(upload %s is not a JSON object)" % rid)
-            out = {"ok": True, "id": rid, "format": document.get("format"),
-                   "game_version": document.get("game_version"), "public_lobby": document.get("public_lobby"),
-                   "timepoint": document.get("timepoint"), "sessions": []}
-            for s in document.get("sessions") or []:
-                if not isinstance(s, dict):
-                    continue
-                rows = []
-                for c in s.get("classification") or []:
-                    if isinstance(c, dict):
-                        rows.append({k: v for k, v in c.items() if k != "steam_id"})
-                decisions = [d for d in (s.get("decisions") or []) if isinstance(d, dict)]
-                counts = {}
-                for d in decisions:
-                    key = "%s/%s" % (d.get("decision_type"), d.get("chosen_by"))
-                    counts[key] = counts.get(key, 0) + 1
-                entry = {"kind": s.get("kind"), "track": s.get("track"), "started_at": s.get("started_at"),
-                         "ended_at": s.get("ended_at"), "race_id": s.get("race_id"), "classification": rows,
-                         "decisions_count": len(decisions), "decisions_by_type": counts}
-                if include_decisions:
-                    entry["decisions"] = [{k: v for k, v in d.items() if k not in ("state", "offered")}
-                                          for d in decisions[:max_decisions]]
-                out["sessions"].append(entry)
-            if headers.get("problems"):
-                out["problems"] = headers["problems"]
-            return clean(out)
+            try:
+                out = await asyncio.to_thread(store.load_summary, result_id, include_decisions, max_decisions,
+                                              include_steam_ids)
+            except ResultsError as e:
+                return results_failure(e)
+            return clean(out, None)
 
     # ================================================================== resources and prompt
 
@@ -1261,47 +1716,23 @@ def build_server(config, log_level="WARNING"):
                  description="Game API reference tables: all, " + ", ".join(R.TOPICS))(_reference_resource)
 
     def _latest_trigger() -> str:
-        """The most recent trigger of the current session (null when none)."""
-        engine = client.triggers
+        """The most recent trigger (null when none)."""
         latest = engine.triggers[-1] if engine.triggers else None
         return json.dumps({"trigger": None if latest is None else clean(engine.public(latest)),
                            "last_seq": engine.seq}, separators=(",", ":"))
 
     mcp.resource(TRIGGERS_URI, name="latest_trigger", mime_type="application/json",
-                 description="The most recent trigger (card_offer, car_damaged, tires_wont_last, tire_screen). "
-                             "The server sends resource-updated notifications for it when it can.")(_latest_trigger)
+                 description="The most recent trigger (card_offer, car_damaged, tires_wont_last, tire_screen, "
+                             "session_ended). Read it on demand: the server sends no resource-updated "
+                             "notifications (wait_for_trigger is the way to be woken).")(_latest_trigger)
 
-    def race_engineer() -> str:
+    def race_engineer(goal: Optional[str] = None) -> str:
         """Run a race as the race engineer: wait for triggers and answer them."""
-        return RACE_ENGINEER_PROMPT
+        return race_engineer_prompt(goal)
 
-    mcp.prompt(name="race_engineer", description="Act as race engineer for player one's car in Backseat Champions: "
-                                                 "loop on wait_for_trigger and answer each decision.")(race_engineer)
+    mcp.prompt(name="race_engineer", description=inspect.cleandoc("Act as race engineer for player one's car in Backseat Champions: "
+                                                 "loop on wait_for_trigger and answer each decision."))(race_engineer)
     return mcp
-
-
-RACE_ENGINEER_PROMPT = """\
-You are the race engineer for player one's car in Backseat Champions. The car is driven by the game's AI; you make the
-strategic calls through the backseat-champions tools. The server never acts by itself.
-
-1. Call get_api_status. If the game is unreachable or switches are off, tell me what to change (Settings >
-   Telemetry) and stop. Note whether Decision Events and Player Input are on.
-2. Loop: call wait_for_trigger. On status "timeout" call it again. On "session_ended", summarise the race briefly
-   and call it again to wait for the next session.
-3. For each trigger (act on the newest; skip superseded ones):
-   - card_offer: compare the cards (upgrade, facility, tier) with the race situation in the context
-     (get_race_snapshot / get_player_state / get_session if you need more). Optionally ban_card(index) first (it
-     costs a ban token and keeps your turn), then pick_card(index). Use only what the data says; do not invent
-     what an upgrade does.
-   - car_damaged: a puncture is definite; a performance_drop is a heuristic. Decide whether to call set_pit(true)
-     (only if can_pit).
-   - tires_wont_last: the forecast says the tires will not last until the end of the next lap. Weigh laps_remaining,
-     pit_lane_time_loss_s and position, then decide set_pit(true).
-   - After calling a stop: wait for the tire screen (a tire_screen trigger if enabled, else
-     wait_for_event(codes=["TIRE"])) and pick_tire with one of `allowed` that has picks left.
-4. If a command fails, read error_reason / hint and adapt; do not retry blindly.
-Keep each turn short: one line on what you decided and why.
-"""
 
 
 # ------------------------------------------------------------------------------------------------ main
@@ -1320,12 +1751,13 @@ _FLAGS = [
     ("--results-host", "BC_RESULTS_HOST", "results receiver address (default 127.0.0.1)"),
     ("--results-token", "BC_RESULTS_TOKEN", "bearer token the game must send with results"),
     ("--results-dir", "BC_RESULTS_DIR", "folder for received results"),
-    ("--triggers", "BC_TRIGGERS", "enabled triggers, comma list (default card_offer,car_damaged,tires_wont_last; "
-                                  "optional tire_screen; 'none' disables all)"),
+    ("--results-keep", "BC_RESULTS_KEEP", "uploads to keep, oldest deleted first (default 100; 0 keeps all)"),
+    ("--triggers", "BC_TRIGGERS", "enabled triggers, comma list (default card_offer,car_damaged,tires_wont_last,"
+                                  "tire_screen; 'none' disables all)"),
     ("--tire-margin", "BC_TIRE_MARGIN", "tires_wont_last: predicted health threshold (default 0.05)"),
     ("--tire-floor", "BC_TIRE_FLOOR", "tires_wont_last: absolute health floor (default 0.10)"),
     ("--perf-drop", "BC_TRIGGER_PERF_DROP", "car_damaged heuristic: relative performance drop (default 0.15; 0 off)"),
-    ("--wait-max-s", "BC_WAIT_MAX_S", "cap for wait_for_trigger timeout_s (default 300)"),
+    ("--wait-max-s", "BC_WAIT_MAX_S", "cap for wait_for_trigger timeout_s (default 55; never above 60)"),
 ]
 
 
@@ -1342,8 +1774,9 @@ def parse_args(argv=None):
     parser.add_argument("--transport", choices=("stdio", "streamable-http"), default="stdio")
     parser.add_argument("--host", default="127.0.0.1", help="streamable-http bind address (default 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8000, help="streamable-http port (default 8000)")
-    parser.add_argument("--log-level", default=os.environ.get("BC_LOG_LEVEL", "WARNING"),
-                        choices=("DEBUG", "INFO", "WARNING", "ERROR"))
+    parser.add_argument("--log-level", default=(os.environ.get("BC_LOG_LEVEL") or "WARNING").strip(),
+                        type=lambda v: v.strip().upper(), choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+                        help="stderr log level, any case (BC_LOG_LEVEL; default WARNING)")
     parser.add_argument("--version", action="version", version=__version__)
     return parser.parse_args(argv)
 
@@ -1356,6 +1789,8 @@ def config_from_args(args, environ=None):
             env[name] = value
     if getattr(args, "allow_drive", False):
         env["BC_ALLOW_DRIVE"] = "1"
+    global PROGRESS_INTERVAL_S
+    PROGRESS_INTERVAL_S = progress_interval(env)
     return Config.from_env(env).validate()
 
 

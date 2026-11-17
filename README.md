@@ -1,309 +1,410 @@
 # backseat-champions-mcp
 
-An **unofficial** [Model Context Protocol](https://modelcontextprotocol.io) server for the official *Game API* of the
-Steam game **Backseat Champions**. It is not made or endorsed by the game's developers.
+An **unofficial** [Model Context Protocol](https://modelcontextprotocol.io) server that lets an LLM such as Claude act
+as **race engineer** for player one's car in the Steam game **Backseat Champions**, through the game's official UDP
+*Game API*. It is not made or endorsed by the game's developers.
 
-In Backseat Champions you do not steer: a machine-learned AI drives, and you manage it during races by picking
-upgrade cards, calling pit stops, choosing tire compounds and holding boost buttons. This server lets an LLM such as
-Claude act as **race engineer** for player one's car through the game's UDP API.
+## Install & connect
 
-**Trigger-driven.** The model is woken only when a decision is needed, through one long-polling tool,
-`wait_for_trigger`:
+Follow the steps in order; each ends with something you can check. Shell commands are run **in the folder of your
+copy of this repository** (the folder with `pyproject.toml`).
+
+### 1. Prerequisites
+
+- Python **3.10 or newer** (`python3 --version`).
+- [uv](https://docs.astral.sh/uv/) (recommended; check with `uv --version`). On macOS and Linux astral's installer
+  is `curl -LsSf https://astral.sh/uv/install.sh | sh` (or `brew install uv`, or `pipx install uv`); see
+  [uv's installation page](https://docs.astral.sh/uv/getting-started/installation/) for Windows and other options.
+  Without uv you need pip and the `venv` module: on Debian / Ubuntu install the `python3-venv` package
+  (`sudo apt install python3-venv`) first.
+- The only dependency, the official MCP Python SDK (`mcp` 2.x), is installed automatically.
+- **Claude desktop app on Linux:** Anthropic's Linux app is in **beta** (Debian 12+ / Ubuntu 22.04+, per
+  [Claude Desktop on Linux](https://code.claude.com/docs/en/desktop-linux)). On other distributions use Claude
+  Code (the CLI).
+
+### 2. Set up the game
+
+In Backseat Champions open **Settings > Telemetry**:
+
+1. Turn the **Game API on** (it is off by default).
+2. Tick the **required** switches: **Driver Data**, **Player Data**, **Decision Events** and **Player Input**.
+   Optional: **AI Observations** (only for `get_ai_observations`, about 1.1 MB/s). **Driver Input** only if you start
+   the server with `BC_ALLOW_DRIVE=1` (it registers `drive`; see the safety notes).
+3. Keep the telemetry target **`127.0.0.1:29770`** and the command listen address **`127.0.0.1:29771`** (both are the
+   game's defaults).
+
+**One listener per port.** Only one program can receive telemetry on a UDP port. Every MCP client starts its own
+copy of this server, so if both Claude Code and the Claude desktop app have it configured and running, the two
+copies fight over 29770 (the second reports `telemetry_listener_down`). The same happens with two Claude
+Code sessions open at once: each starts its own copy. Use one client at a time, or add a second
+telemetry target in the game with its own port (for example `127.0.0.1:29772`) and start the second copy with
+`BC_TELEMETRY_PORT=29772`. The same applies to the game's own `gameapi_client.py listen` or any other telemetry tool.
+
+### 3. Install and register the server
+
+**Install it as a uv tool** (recommended). In the repository folder run:
+
+```sh
+uv tool install .
+command -v backseat-champions-mcp    # prints the absolute path of the installed command
+backseat-champions-mcp --version     # prints the version; also confirms the install works
+```
+
+This builds the server once and puts the `backseat-champions-mcp` command in uv's tool bin folder (`uv tool dir
+--bin` shows it; if `command -v` prints nothing, that folder is not on your `PATH`: run `uv tool update-shell` and
+open a new terminal, or use `$(uv tool dir --bin)/backseat-champions-mcp`). Use the **absolute path** in the client
+configuration below, so the client does not depend on your shell's `PATH`.
+
+**Claude Code:**
+
+```sh
+claude mcp add --transport stdio backseat-champions -- "$(command -v backseat-champions-mcp)"
+```
+
+(Your shell replaces `$(command -v ...)` with the absolute path. Add `--scope user` before the name to make it
+available in every project.) Check with `claude mcp list`.
+
+**Claude desktop app.** Open its configuration file through the app: *Settings > Developer > Edit Config* (the file
+is `claude_desktop_config.json`; let the app show you where it is rather than guessing a path, especially on the
+Linux beta). Add:
+
+```json
+{
+  "mcpServers": {
+    "backseat-champions": {
+      "command": "/absolute/path/to/backseat-champions-mcp"
+    }
+  }
+}
+```
+
+- For `"command"`, use the output of `command -v backseat-champions-mcp` (the app does not read your shell's
+  `PATH`).
+- Configuration files do **not** expand `~` or `$HOME`: write the paths out in full.
+- Environment variables (see [Configuration](#configuration)) go in an optional `"env": { "BC_TELEMETRY_PORT":
+  "29772" }` next to `"command"`.
+
+Then fully quit the app (not just close its window) and reopen it.
+
+**Alternative: `uvx` without installing.** `uvx --from /path/to/backseat_champions_ai-server backseat-champions-mcp`
+builds and runs the checkout from uv's cache (Claude Code: `claude mcp add --transport stdio backseat-champions --
+uvx --from "$PWD" backseat-champions-mcp`; desktop app: `"command"` = the output of `command -v uvx`, `"args":
+["--from", "/path/to/backseat_champions_ai-server", "backseat-champions-mcp"]`). Warm the build once in a terminal
+with `uvx --from "$PWD" backseat-champions-mcp --version` before connecting, so the client's first start does not
+wait for the download and build. **Do not mix the two ways:** once the server is installed as a uv tool,
+`uvx --from <checkout> backseat-champions-mcp` runs the *installed* tool, not the checkout (seen with uv 0.11.32).
+
+**Without uv:** `python3 -m venv .venv && . .venv/bin/activate && pip install .`, then use the absolute path of
+`.venv/bin/backseat-champions-mcp` as the command (no arguments); after a source change run `pip install .` again.
+`--transport streamable-http --port 8000` serves `http://127.0.0.1:8000/mcp` instead of stdio.
+
+**Updating.** Neither the installed tool nor `uvx` notices a change to the Python source by itself. Tested with uv
+0.11.32:
+
+- uv tool install: after pulling or changing the source, run `uv tool install --reinstall .` in the repository
+  folder (for a git checkout: `git pull && uv tool install --reinstall .`), then fully quit and
+  reopen the desktop app (or start a new Claude Code session). The command path stays the same, so the
+  configuration does not change. (`uv tool upgrade` is not reliable for a local folder: it can report "Nothing to
+  upgrade" while the source changed.)
+- uvx: after `git pull`, run `uv cache clean backseat-champions-mcp && uv cache prune` (or `uv cache clean`, which
+  empties the whole cache), then restart the client. `uv cache clean backseat-champions-mcp` alone,
+  `uvx --refresh`, `--refresh-package` and `--reinstall` still ran the old build in this test. A change to
+  `pyproject.toml` (a version bump, say) does make `uvx` rebuild by itself.
+- **How to confirm:** `backseat-champions-mcp --version` in a terminal, or ask the model for `get_api_status`:
+  its `server_version` must be the new version. That only distinguishes builds with different versions, so
+  prefer pulling tagged releases (each bumps the version) to running arbitrary commits.
+
+### 4. Verify
+
+Ask the model to call `get_api_status`. Expect:
+
+- `server_version`: the version in `pyproject.toml`;
+- `game.reachable: true` and `game.required_switches_off: []`;
+- `telemetry.bound: true` (false: another program holds the port, see above).
+
+`telemetry.receiving` only becomes true once a session runs.
+
+### 5. Start a race
+
+Start the session in the game yourself: **the API cannot start races**. Then `telemetry.receiving` is true. Ask
+Claude to "be my race engineer", or invoke the `race_engineer` prompt.
+
+### Troubleshooting first steps
+
+| Symptom | Cause / fix |
+|---|---|
+| `telemetry_listener_down`, "address in use", `telemetry.bound: false` | Another program holds the telemetry port: usually a second copy of this server started by another MCP client, or `gameapi_client.py listen`. Close it (the server retries every 2 s), or use a second telemetry target port and `BC_TELEMETRY_PORT`. Commands still work. |
+| `game.reachable: false` | Game not running, Game API off, or a different `BC_COMMAND_HOST` / `BC_COMMAND_PORT`. |
+| `receiving: false`, `not_in_session` | The game sends no telemetry outside a session (practice, qualifying, race). Start one in the game. |
+| `paused: true`, data "frozen" | The game stops time while a card hand waits: only Session, Car Status and Participants keep coming. Answer the hand (`pick_card`). |
+| A tool call fails after about 80 s with a client error | Some clients cut tool calls at about 80 s whatever the progress notifications (seen with the Claude desktop app's remote-device bridge). `wait_for_trigger` waits at most 55 s by default and never more than 60 s, which avoids this. If a result is lost anyway, pass `since_seq`: an open decision comes back about 20 s after it was last returned (at most 3 times), another trigger once. |
+| Old behaviour after an update | Installed tool: `uv tool install --reinstall .`; uvx: `uv cache clean backseat-champions-mcp && uv cache prune`. Then fully restart the client and check `server_version` (see **Updating**). |
+| `boost` / `drive` returns `no_reply` | Usually the game is not answering. Under an extreme flood of replies, though, their liveness ping can time out while the hold has started: check `get_car_abilities` (`api_boosting`) / `get_api_status` (holds), or call `stop_boost` / `release_drive`. |
+
+## Does the AI need instructions?
+
+No setup is needed. The server ships its own operating guide in three places:
+
+- the MCP `initialize` result's `instructions`: the race loop in under 20 lines. Most MCP clients pass these to
+  the model; if yours doesn't, invoke the `race_engineer` prompt;
+- every tool's description;
+- the `race_engineer` prompt (optional argument `goal`): the same loop in more detail.
+
+In short: call `get_api_status` first; then loop on `wait_for_trigger(timeout_s=55, since_seq=last)`; answer a
+`card_offer` first and at once with `pick_card(index, seq)` (the game pauses while a hand waits); answer
+`tire_screen` with `pick_tire`; on `tires_wont_last` / `car_damaged` decide `set_pit`; set `last` to the result's
+`last_seq` after acting. Use `car="me"`, `"ahead"` or `"behind"` instead of car indices, which change with positions.
+
+### Other MCP clients
+
+The server should work with any MCP client that launches stdio servers (command = the installed
+`backseat-champions-mcp`), or over `--transport streamable-http`. The steps above are written for Claude Code and
+the Claude desktop app; for other clients note:
+
+- Delivery of the `instructions` to the model varies; use the `race_engineer` prompt (or paste its text) if the
+  model does not seem to know the loop.
+- Tool-call timeouts vary. `wait_for_trigger` blocks up to 55 s; if your client cuts tool calls sooner, set
+  `BC_WAIT_MAX_S` a few seconds below its limit.
+- The loop needs a model that follows multi-step tool instructions; weaker models may loop poorly (polling,
+  retrying failed calls, missing `since_seq`).
+
+## The trigger model
+
+`wait_for_trigger` is the one wake source: the model is woken only when a decision is needed.
 
 | Trigger | When | Typical answer |
 |---|---|---|
-| `card_offer` | a new hand of upgrade cards is offered | `ban_card` (optional), `pick_card` |
-| `car_damaged` | puncture flag 0 -> 1 (definite), or a sudden car-specific performance drop (heuristic) | `set_pit(true)` |
-| `tires_wont_last` | tire health is forecast not to last until the end of the next lap (heuristic) | `set_pit(true)`, then `pick_tire` |
-| `tire_screen` *(off by default)* | the tire selection screen opened | `pick_tire` |
+| `card_offer` | a new hand of upgrade cards is offered (the game pauses until it is answered) | `ban_card` (optional), `pick_card(index, seq)` |
+| `tire_screen` | the tire selection screen opened (grid, qualifying box, pit stop) | `pick_tire` |
+| `tires_wont_last` | tire health is forecast not to last to the end of the next lap (heuristic) | `set_pit(true)`, then the `tire_screen` |
+| `car_damaged` | puncture (definite) or a sudden car-specific performance drop (heuristic) | puncture: `set_pit(true)` if `can_pit` and the race is not nearly over; performance drop: check `get_car_status` first, pit only on a clear failure |
+| `session_ended` | `SEND` or `FINI` for seat 0, once per session | summarise |
 
-Everything else (standings, telemetry, session, abilities, events, ...) is available as on-demand query tools. **The
-server never sends a command on its own.**
+Enabled by default: `card_offer`, `car_damaged`, `tires_wont_last`, `tire_screen` (`BC_TRIGGERS`); `session_ended`
+is always on.
 
-Documentation in this folder:
+### Delivery and acknowledgement
 
-- [docs/TOOLS.md](docs/TOOLS.md): every tool with parameters (generated from the server).
-- [docs/API_REFERENCE.md](docs/API_REFERENCE.md): the Game API itself (packets, events, commands, enums, quirks).
+- Every trigger gets an increasing `seq` and stays in a bounded queue, across sessions.
+- `wait_for_trigger(timeout_s, since_seq)` acknowledges everything up to `since_seq` and returns **at once** if
+  anything is *due*; otherwise it blocks until something becomes due or the timeout passes. The wait is
+  `min(timeout_s, BC_WAIT_MAX_S, 60)` seconds, 55 by default.
+- **Due** means: not acknowledged, and either never returned, or returned at least 20 s ago and still within its
+  resend budget: 3 resends for an open decision (`card_offer`, `tire_screen`), 1 for other types when `since_seq`
+  is passed, none without `since_seq`. Resent entries carry `resent: true`. So a result the client lost comes back
+  on a later wait once 20 s have passed since it was last returned (not instantly), and an unanswered hand is
+  returned again without becoming a busy loop.
+- **The 55 s cap is the primary protection** against clients that cut a tool call at about 80 s (the Claude desktop
+  app's device bridge): a wait that ends before the cutoff never loses its result. Resends are the fallback; in
+  that rare case the game can stay paused on a card hand for up to about 20 s before the hand comes back.
+- Superseded entries (a newer hand or tire screen; new tires since a tire warning or damage), decisions known to be
+  closed, and entries of an old session (except that session's `session_ended`) are not returned; `skipped` counts
+  them.
+- Every result, timeouts included, carries `last_seq` (pass it as `since_seq` next time) and `open_decisions` (the
+  live open card hand and tire screen). `open_decisions` never makes a call return early.
+- `status` is `triggered`, `session_ended` (the last entry ended the session) or `timeout`.
+- A new server process ignores the first `since_seq` it gets, and a `since_seq` above the newest seq resets the
+  acknowledgement (the server was restarted).
+- The server sends no resource-updated or log notifications; `bc://triggers/latest` can be read on demand
+  (`wait_for_trigger` is the way to be woken).
 
-## Enabling the Game API in the game
+### What fires each trigger
 
-The API is **off by default**. In the game open **Settings > Telemetry** and turn it on. The defaults match this
-server: telemetry to `127.0.0.1:29770`, commands on `127.0.0.1:29771`. Telemetry is only sent **during a session**
-(practice, qualifying, race). Then tick the switches the tools you want need:
+All thresholds are **this server's tunable heuristics, not values from the game**.
 
-| Switch | Needed by |
-|---|---|
-| Driver Data | `get_standings`, `get_participants`, `get_car_telemetry`, `get_car_motion`, `get_car_status`, `get_racing_line`, `get_car_abilities`; lap counting and the performance-drop heuristic of the triggers |
-| Player Data | `get_player_state`, `get_pending_decisions`, `get_car_abilities`; tire health, puncture, laps remaining and pit flags for the triggers; the card-offer fallback |
-| Decision Events | `get_events`, `wait_for_event`; `card_offer` from CARD events; `tire_screen`; the open tire screen in `get_pending_decisions`; `session_ended` |
-| AI Observations (off by default, ~1.1 MB/s) | `get_ai_observations` (only on the machine that simulates the cars) |
-| Player Input | `pick_card`, `ban_card`, `set_pit`, `pick_tire`, `boost`, `stop_boost`, `set_camera` |
-| Driver Input | `drive`, `release_drive` (only registered with `BC_ALLOW_DRIVE=1`) |
+- **card_offer** (not heuristic). A `CARD` event for seat 0 with points > 0 and a hand. Without Decision Events, or
+  when no `CARD` event announced a hand within 2 s, the Player packet: points > 0 and a hand whose cards differ from
+  the last one, stable for 0.25 s. One hand is one trigger whichever source sees it first; a `CARD` event repeating
+  the same cards and points (after a ban, say) is ignored. A hand counts as answered on a successful `pick_card`
+  (or `no_points`), not on `cards_unavailable`. `pick_card(index, seq)` is refused with `hand_changed` if the hand on
+  offer is no longer that trigger's hand.
+- **tire_screen** (not heuristic). Every `TIRE` event for seat 0 (`pre_race`, `current`, `allowed`, `picks_left`).
+- **car_damaged**, `signal: "puncture"` (definite): your car's puncture flag (Player, or Car Telemetry without Player
+  Data) set in two consecutive samples. Re-arms after the flag has been clear for 3 s of session time, or on pit
+  exit. Payload includes `can_pit`, `pit_planned`, `in_pits`, `laps_remaining`.
+- **car_damaged**, `signal: "performance_drop"` (`heuristic: true`). The README says Car Status performance is
+  "moved by weather, slipstream, abilities and failures" but has no failure flag. One trigger per Car Status packet
+  lists every area of your car that dropped by at least `BC_TRIGGER_PERF_DROP` (15 %) within
+  `BC_TRIGGER_PERF_WINDOW_S` (2 s), confirmed only if the drop persists for 1 s of session time while the field
+  median of that area did not drop by half the threshold (weather). It is skipped while an ability of your car
+  (boost, DRS, overspeed, recharging, slipstream) is active, so a failure during a boost can be missed. Not in the
+  pit lane. Expiring temporary upgrades could look the same.
+- **tires_wont_last** (heuristic forecast). Wear per lap is the median of the last full laps on the current tire set,
+  measured from tire health at lap boundaries; the current lap is also extrapolated from its wear so far over the
+  elapsed share of a lap (at least 25 %), in session time, and the higher figure is used (wear is bursty and can
+  accelerate). `predicted = health - wear_per_lap * (rest of this lap + 1 lap)`. It fires when
+  `predicted <= BC_TIRE_MARGIN` (0.05). `BC_TIRE_FLOOR` (0.10) applies **only when there is no forecast yet**
+  (`reason: "floor_no_forecast"`): with a forecast, a low but sufficient health does not fire. Silent after the
+  flag, on the last lap (laps remaining <= 1 in a race with a lap count), in the pit lane, or with a stop already
+  called. Re-arms after new tires or when the forecast recovers.
+- **Laps.** Laps completed come from Lap Data (`lap`, laps completed per the README) and Player
+  (`total_laps - laps_remaining`); the `LAPC` event only marks a lap boundary (whether its `lap` is the completed or
+  the new lap is not documented; `get_trigger_config` shows the last ones in `lap_observations` so a live run settles it).
 
-Recommended for the race-engineer workflow: Driver Data, Player Data, Decision Events and Player Input.
-`get_api_status` reports which switches are off and which tools that breaks.
+### Pauses and car indices
 
-## Install and run
+**Pauses** (observed in game 0.88.2). The game stops time while a card hand waits: only Session, Car Status (twice a
+second) and Participants keep arriving and `session_time` stops. Time-based heuristics run on `session_time`, so a
+pause does not distort them; `get_api_status`, `get_race_snapshot` and wait results report `paused` instead of
+"telemetry stopped".
 
-Requires Python 3.10 or newer. The only dependency is the official MCP Python SDK, `mcp` 2.x (where the former
-`FastMCP` class is called `MCPServer`).
-
-With [uv](https://docs.astral.sh/uv/):
-
-```sh
-uv tool install .          # run in the repository folder; installs the backseat-champions-mcp command
-# or run without installing:
-uvx --from . backseat-champions-mcp --help
-```
-
-With pip:
-
-```sh
-python -m venv .venv && . .venv/bin/activate
-pip install .                     # run in the repository folder
-backseat-champions-mcp --help
-```
-
-The server speaks MCP over **stdio** by default; `--transport streamable-http --port 8000` serves
-`http://127.0.0.1:8000/mcp` instead. Logs go to stderr (`--log-level`, `BC_LOG_LEVEL`); stdout carries only MCP.
-
-### Claude Desktop
-
-`claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "backseat-champions": {
-      "command": "uvx",
-      "args": ["--from", "/path/to/backseat_champions_ai-server", "backseat-champions-mcp"],
-      "env": { "BC_TRIGGERS": "card_offer,car_damaged,tires_wont_last" }
-    }
-  }
-}
-```
-
-Replace `/path/to/backseat_champions_ai-server` with the absolute path of your copy of this repository: the config
-file does not expand `~`, `$HOME` or relative paths. If the app can't find `uvx`, give its absolute path too
-(`which uvx`).
-
-### Claude Code
-
-```sh
-claude mcp add --env BC_WAIT_MAX_S=240 --transport stdio backseat-champions \
-  -- uvx --from "$PWD" backseat-champions-mcp   # run in the repository folder
-```
-
-or in `.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "backseat-champions": {
-      "command": "uvx",
-      "args": ["--from", "/path/to/backseat_champions_ai-server", "backseat-champions-mcp"],
-      "env": { "BC_WAIT_MAX_S": "240" },
-      "timeout": 300000
-    }
-  }
-}
-```
-
-`wait_for_trigger` blocks for up to `BC_WAIT_MAX_S` seconds (default 300) and sends MCP progress notifications every
-10 s while it waits. Your MCP client's own tool timeout must be longer than that: in Claude Code the per-server
-`timeout` (milliseconds) or `MCP_TOOL_TIMEOUT` is a hard limit per call that progress notifications do not extend.
-If in doubt, lower `BC_WAIT_MAX_S`; on timeout the tool just returns `status: "timeout"` and the model calls it again.
-
-Then ask Claude to use the `race_engineer` prompt, or: "Be my race engineer: call get_api_status, then loop on
-wait_for_trigger and handle each trigger."
+**Car indices** (observed in game 0.88.2). The game README says a car's index stays the same for the whole session,
+but in 0.88.2 the participant list and `seat_car` were re-ordered by race position mid-race. The server takes "my
+car" from each packet's own `seat_car[0]`, names other cars only from a Participants packet of the same frame, and
+returns the stable `player_id`. Tools accept `car="me"`, `"ahead"`, `"behind"` (resolved by position in the newest
+Lap Data) or `"P<n>"`; an integer index is valid for that instant only.
 
 ## Configuration
 
-Every setting is an environment variable; most also have a CLI flag that overrides it (`--telemetry-port` for
-`BC_TELEMETRY_PORT`, ...). `backseat-champions-mcp --help` lists the flags.
+Every setting is an environment variable; most also have a CLI flag that overrides it (`backseat-champions-mcp
+--help` lists them).
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `BC_TELEMETRY_HOST` | `127.0.0.1` | address telemetry is received on. Off loopback, telemetry is only accepted from `BC_GAME_HOST` |
 | `BC_TELEMETRY_PORT` | `29770` | telemetry UDP port (a target set under Settings > Telemetry) |
-| `BC_GAME_HOST` | = `BC_COMMAND_HOST` | the only sender accepted when listening off loopback |
+| `BC_TELEMETRY_REUSE` | `auto` | `auto` / `on` / `off`: SO_REUSEADDR (+ SO_REUSEPORT) on the telemetry socket; `auto` = not on Windows |
+| `BC_GAME_HOST` | = `BC_COMMAND_HOST` | the only telemetry sender accepted when listening off loopback |
 | `BC_COMMAND_HOST` | `127.0.0.1` | the game's command address |
 | `BC_COMMAND_PORT` | `29771` | the game's command UDP port |
-| `BC_COMMAND_TOKEN` | empty | Command Token, needed only when the game runs on another machine; 12 to 47 UTF-8 bytes |
+| `BC_COMMAND_TOKEN` | empty | Command Token, only for a game on another machine; 12 to 47 UTF-8 bytes |
 | `BC_COMMAND_TIMEOUT` | `1.0` | seconds to wait for Ack / Error |
 | `BC_ALLOW_DRIVE` | off | `1` registers `drive` / `release_drive` (see safety notes) |
-| `BC_TELEMETRY_REUSE` | `auto` | `auto` / `on` / `off`: set SO_REUSEADDR (+ SO_REUSEPORT) on the telemetry socket; `auto` = not on Windows |
-| `BC_TRIGGERS` | `card_offer,car_damaged,tires_wont_last` | enabled triggers; add `tire_screen`; `none` disables all |
+| `BC_TRIGGERS` | `card_offer,car_damaged,tires_wont_last,tire_screen` | enabled triggers; `none` disables all |
+| `BC_WAIT_MAX_S` | `55` | longest `wait_for_trigger` wait; it can only lower the hard cap of 60 s |
+| `BC_PROGRESS_INTERVAL_S` | `10` | seconds between MCP progress notifications during waits; a number > 0 and <= 60, otherwise the server exits (code 2) with a message |
+| `BC_REMIND_S` | `20` | advanced, meant for tests: seconds before an unacknowledged trigger is resent (must be > 0); the "20 s" in this README assumes the default |
 | `BC_TIRE_MARGIN` | `0.05` | `tires_wont_last`: fire when predicted health at the end of the next lap is at or below this |
-| `BC_TIRE_FLOOR` | `0.10` | `tires_wont_last`: fire when health is at or below this, whatever the forecast |
+| `BC_TIRE_FLOOR` | `0.10` | `tires_wont_last`: fire at or below this health only while there is no forecast |
 | `BC_TRIGGER_PERF_DROP` | `0.15` | `car_damaged` heuristic: relative drop of a performance area (`0` disables it) |
-| `BC_TRIGGER_PERF_WINDOW_S` | `2.0` | ... within this many seconds |
-| `BC_WAIT_MAX_S` | `300` | longest `wait_for_trigger` wait (1..3600) |
+| `BC_TRIGGER_PERF_WINDOW_S` | `2.0` | ... within this many seconds of session time |
 | `BC_RESULTS_PORT` | unset | enable the race results receiver on this TCP port (e.g. `29780`) |
 | `BC_RESULTS_HOST` | `127.0.0.1` | results receiver address; off loopback a token is required |
 | `BC_RESULTS_TOKEN` | empty | bearer token the game must send |
-| `BC_RESULTS_DIR` | `~/.backseat-champions-mcp/race-results` | where uploads are stored |
-| `BC_LOG_LEVEL` | `WARNING` | stderr log level |
-
-### Race results (optional)
-
-When you **host**, the game can upload each finished race weekend to your own endpoints (Settings > Telemetry >
-Race Results). With `BC_RESULTS_PORT=29780` this server listens on `http://127.0.0.1:29780/`; add that URL (and
-`BC_RESULTS_TOKEN` as its token, if you set one) in the game. The game never retries an upload. The tools
-`list_race_results` and `get_race_result` appear only when the receiver is enabled. Like the game's own
-`gameapi_client.py results-server`, the receiver refuses requests with an `Origin` header or without
-`X-BC-Format`, bodies over 16 MB, and ZIPs that unpack to over 256 MB.
-
-## The trigger model
-
-The engine (`src/backseat_champions_mcp/triggers.py`) watches the decoded telemetry of seat 0's car. Each trigger is
-**edge-triggered**: it fires once per occurrence and re-arms. Triggers get increasing sequence numbers and are kept
-in a bounded queue that is cleared when a new session starts (the numbers keep increasing).
-`wait_for_trigger` returns every not-yet-delivered trigger at once, with a compact race context; older ones may be
-marked `superseded` (a newer hand arrived, or the car has had new tires since).
-
-All thresholds below are **this server's tunable heuristics, not values from the game**.
-
-- **card_offer** (not heuristic). Fires on a `CARD` event for seat 0 (points > 0 and a hand). Without Decision Events
-  it uses the Player packet: points > 0 and a hand whose cards (upgrade, facility, tier) differ from the last one
-  seen, stable for 0.25 s. With Decision Events on, a hand that no `CARD` event announced within 2 s (for example one
-  already on offer when the server started) is still reported from the Player packet. One hand is one trigger even
-  if both sources see it; a `CARD` event repeating the same cards and points (for example after a ban) is ignored.
-  Limitation: without Decision Events, a new hand with exactly the same cards as the previous one is not detected.
-- **car_damaged**, signal `puncture` (definite): the puncture flag of your car (Player packet, or Car Telemetry when
-  Player Data is off) goes 0 -> 1. Re-arms when the flag clears; a puncture still showing after leaving the pit lane
-  is reported again.
-- **car_damaged**, signal `performance_drop` (`heuristic: true`): the README says Car Status performance is "moved by
-  weather, slipstream, abilities and failures" but has no failure flag. The server reports a relative drop of at
-  least `BC_TRIGGER_PERF_DROP` (15 %) of one area within `BC_TRIGGER_PERF_WINDOW_S` (2 s) when most other cars' same
-  area did not drop by half that (weather), no ability of your car (boost, DRS, overspeed, recharging, slipstream
-  > 0.05) was active in that window, and the car is not in the pit lane. It re-arms when the area recovers.
-  Expiring temporary upgrades could look the same.
-- **tires_wont_last** (heuristic forecast). Wear per lap is the median of the last three full laps on the current
-  tire set, measured from tire health at lap boundaries (Lap Data lap counter or `LAPC` event). Before one full lap is
-  measured, it is extrapolated from the wear so far in this lap divided by the elapsed share of a lap (lap time:
-  observed, else the strategy model's `reference_lap_s`, else the track's `lap_time_est_s`; at least 25 % of a lap
-  must have passed). The tire set restarts on pit exit, a compound change, or health rising.
-  `predicted = health - wear_per_lap * (rest of this lap + 1 lap)` (capped at the race distance left). It fires when
-  `predicted <= BC_TIRE_MARGIN` (0.05) or `health <= BC_TIRE_FLOOR` (0.10), but not after the flag, on the last lap
-  (laps_remaining <= 1 in a session with a lap count; without Player Data, laps_remaining is
-  total_laps - laps completed), in the pit lane, or when a stop is already called (it fires
-  if that call is cancelled). It re-arms after a pit exit / new tires or when the forecast recovers 0.03 above the
-  margin. Payload: tire_health, wear_per_lap and how it was derived, predicted health, laps_remaining, can_pit,
-  pit_planned, compound, compound_picks_left, pit_lane_time_loss_s, lap time and its source.
-- **tire_screen** (off by default): every `TIRE` event for seat 0 (pre_race, current, allowed, picks_left).
-- **session end** is not a trigger: on `SEND` (or `FINI` for seat 0) `wait_for_trigger` returns
-  `status: "session_ended"` once.
-
-When a trigger fires, the server also sends, best effort, a `notifications/resources/updated` for
-`bc://triggers/latest` and a log notification to the most recent MCP session.
+| `BC_RESULTS_DIR` | `~/.backseat-champions-mcp/race-results` | where uploads are stored (folder 0700, files 0600). A leading `~` is expanded to your home folder and a relative path is resolved against the server's working directory at start, which a client chooses: use an absolute path |
+| `BC_RESULTS_KEEP` | `100` | uploads kept; the oldest are deleted when the receiver starts and after each new upload (`0` keeps all) |
+| `BC_LOG_LEVEL` | `WARNING` | stderr log level: DEBUG, INFO, WARNING or ERROR, any case |
 
 ## Tools
 
-See [docs/TOOLS.md](docs/TOOLS.md) for full descriptions and parameters.
+[docs/TOOLS.md](docs/TOOLS.md) has every tool with its parameters (generated from the server).
+[docs/API_REFERENCE.md](docs/API_REFERENCE.md) has notes on the game's Game API (packets, events, commands, enums).
 
 | Tool | Summary |
 |---|---|
-| `get_api_status` | hello + ping: game version, switches (and what is off), listener health, holds, triggers, config |
-| `ping` | liveness check with latency |
-| `get_session` | session type, laps, fuel/boost, weather, input flags, track properties |
-| `get_participants` | every car: name, car type, kind (ai / local / remote) |
-| `get_standings` | running order with laps, gaps, pit state |
-| `get_car_telemetry` | speed, pedal, steer, tire compound/health, puncture, energy (car "me" / index / "all") |
-| `get_car_motion` | world position, velocity, orientation |
-| `get_car_status` | performance ratio per area, with the field median |
-| `get_car_abilities` | boosts, DRS, slipstream, recharge; your unlocks and ban tokens |
-| `get_player_state` | points, hand, laps, pit flags, tires, compound picks left, energy, strategy scalars |
-| `get_pending_decisions` | open card hand, pit call state, open tire screen |
-| `get_racing_line` | next checkpoints: racing line and track edges |
-| `get_ai_observations` | the AI driver's net: policy, last action, optional input vector |
-| `get_events` | buffered events with sequence numbers |
-| `wait_for_event` | block until a matching event (max 60 s) |
-| `get_race_snapshot` | compact overview of the race for your car |
-| `get_reference` | static tables: enums, error reasons, events, packets, commands, switches, rules, triggers |
 | `wait_for_trigger` | block until a decision is needed (the main loop) |
-| `get_triggers` | recent triggers without waiting |
-| `get_trigger_config` | enabled triggers, thresholds and live tire-wear forecast |
-| `pick_card` | pick a card from the hand |
-| `ban_card` | ban a card (spends a ban token, keeps your turn) |
+| `get_api_status` | hello + ping: game version, switches (required / optional), listener health, pause, config |
+| `get_race_snapshot` | compact overview of the race for your car |
+| `get_pending_decisions` | open card hand, pit call state, open tire screen |
+| `pick_card` / `ban_card` | pick or ban a card from the hand (optional `seq` guard) |
 | `set_pit` | call or cancel a pit stop |
 | `pick_tire` | pick a compound while the tire screen is open |
-| `boost` | hold boost buttons for a duration (re-sent at 50 Hz) |
-| `stop_boost` | release boost buttons now |
+| `boost` / `stop_boost` | hold boost buttons for `duration_s` 0.05 to 30 s (re-sent at 50 Hz) / release them |
 | `set_camera` | change your camera view |
-| `drive` / `release_drive` | only with `BC_ALLOW_DRIVE=1`: take over pedal and steering / hand the car back |
-| `list_race_results` / `get_race_result` | only with `BC_RESULTS_PORT`: uploaded race weekends |
+| `get_session`, `get_participants`, `get_standings` | session, cars (with `player_id`), running order |
+| `get_car_telemetry`, `get_car_motion`, `get_car_status`, `get_car_abilities` | per-car data (`car="me"`, `"ahead"`, `"behind"`, `"P<n>"`, an index or `"all"`) |
+| `get_player_state` | points, hand, laps, pit flags, tires, compound picks left, energy, strategy scalars |
+| `get_racing_line`, `get_ai_observations` | next checkpoints; the AI driver's net |
+| `get_events`, `wait_for_event` | buffered game events (not needed for the race loop) |
+| `get_triggers`, `get_trigger_config` | recent triggers; enabled triggers, thresholds, tire forecast, lap observations |
+| `get_reference` | static tables: enums, error reasons, events, packets, commands, switches, rules, triggers, observed behaviour |
+| `ping` | liveness check with latency |
+| `drive` / `release_drive` | only with `BC_ALLOW_DRIVE=1`; `duration_s` 0.05 to 10 s |
+| `list_race_results` / `get_race_result` | only with `BC_RESULTS_PORT` |
 
 Resources: `bc://reference/{topic}`, `bc://triggers/latest`. Prompt: `race_engineer`.
 
-Every command result is `{ok: true, ...}` or `{ok: false, error_reason, explanation, hint}`; every error reason of
-the game is mapped to an explanation and a hint. `boost` and `drive` are only answered when the game refuses them,
-so their success is *presumed* when the game answers a ping and sends no error within 0.2 s; the tools say so.
+Every tool result is `{ok: true, ...}` or `{ok: false, error_reason, explanation, hint}`. **Exception:** arguments
+that do not match a tool's schema (a wrong type, an out-of-range number, `true` where an integer is expected) are
+rejected by the MCP layer before the tool runs and arrive as plain MCP error text (`isError: true`), not in that
+shape. A reply of the wrong kind from the game is `protocol_error`; `no_reply` on `pick_card` / `ban_card` /
+`set_pit` / `pick_tire` carries `outcome_unknown: true` (check the state before retrying). `boost` and `drive` are
+only answered when the game refuses them, so their success is *presumed* when the game answers a ping and sends no
+error within 0.2 s.
 
 ## Safety notes
 
+- **No autonomous actions.** The server never sends a gameplay command on its own: only the read-only `hello`
+  handshake is sent unasked (at start, on a new session at most once a second, and from read tools when data is
+  missing, to say why). Nothing changes in the race unless the model calls a command tool.
 - **Seat rule.** Only player one's car (seat 0) can be commanded; the server always sends seat 0.
-- **Public lobbies.** In a public lobby the game refuses every command except `ping`, `hello` and `set_camera`
-  (`public_lobby`), and hands back a car being driven or boosted. Telemetry still flows.
+- **Public lobbies.** The game refuses every command except `ping`, `hello` and `set_camera` (`public_lobby`).
+  Telemetry still flows.
 - **drive** is not registered unless `BC_ALLOW_DRIVE=1`. Driving through the API **withholds achievements, Steam stats
-  and leaderboard submissions for the whole race weekend** (a race after qualifying on the same track counts), and
-  only works where this machine simulates the car.
+  and leaderboard submissions for the whole race weekend**, and only works where this machine simulates the car.
+  (The README says `boost` does not count as driver input; that boosting does not withhold them is inferred.)
 - **Command Token.** Commands from another machine must carry the token set in the game; it travels in plain text, so
   use it only on trusted networks. Prefer the environment variable to the CLI flag (visible in process lists).
   `get_api_status` never shows the token.
-- **Remote telemetry.** When listening on a non-loopback address the server accepts telemetry only from the game host,
-  so nobody else on the network can feed it fake events.
-- **One listener per port.** Two programs cannot both receive the stream on one UDP port. The server first checks that
-  the port is free (so a second copy never silently shares and loses half the datagrams), then binds with
-  SO_REUSEADDR/SO_REUSEPORT as requested.
+- **Remote telemetry.** Off loopback the server accepts telemetry only from the game host.
+- **One listener per port.** The server checks that the port is free before binding, so a second copy never silently
+  shares the port and loses half the datagrams.
 
-## Troubleshooting
+## Race results receiver (optional)
 
-| Symptom | Cause / fix |
-|---|---|
-| `game.reachable: false`, `game_unreachable` / `no_reply` | Game not running, API off (Settings > Telemetry), wrong `BC_COMMAND_HOST`/`PORT`, or a missing / wrong Command Token for a game on another machine (the game drops those silently). |
-| `telemetry_listener_down` | Another program holds the telemetry port: a second copy of this server (e.g. started by another MCP client), `gameapi_client.py listen`, or another tool. Close it, or add a second telemetry target with another port in the game and set `BC_TELEMETRY_PORT`. Commands still work. |
-| `switch_off` | The game is running but the needed switch is off; the error names it. |
-| `not_in_session` / no telemetry | The game sends telemetry only during a session. |
-| `wait_for_trigger` fails with a client timeout | Lower `BC_WAIT_MAX_S` or raise the client's tool timeout. |
-| No `card_offer` | Card offers need Decision Events (or Player Data for the fallback) and points > 0. `get_trigger_config` shows the source in use. |
-| `tires_wont_last` seems late or early | It is a forecast; `get_trigger_config` shows the samples, lap time source and prediction. Tune `BC_TIRE_MARGIN` / `BC_TIRE_FLOOR`. |
-| `input_disabled` | Switch on Player Input (or Driver Input for drive). |
+When you **host**, the game can upload each finished race weekend to your endpoints (Settings > Telemetry > Race
+Results). With `BC_RESULTS_PORT=29780` this server listens on `http://127.0.0.1:29780/`; add that URL (and
+`BC_RESULTS_TOKEN` as its token, if set) in the game. `list_race_results` and `get_race_result` appear only then.
 
-## Verifying against the live game
+- **Lifetime.** The receiver runs only while this server process runs; the game does not retry, so a weekend that
+  ends while the server is not running is lost.
+- **Guards** (as the game's `gameapi_client.py results-server`): an `Origin` header or a missing `X-BC-Format` is
+  refused (403), a wrong token 401, bodies over 16 MB 413, ZIPs unpacking to over 256 MB or anything that is not
+  readable JSON 422. Timeouts: the request line and headers must arrive within 10 s of the connection being served
+  (else it is closed without an answer); the body within 30 s, or `size / 128 KiB/s` for bodies over 3.75 MB, at
+  most 120 s (else 408); a connection that sends nothing for 30 s is closed. At most 16 connections are served at
+  once; a new one waits up to 11 s for a free slot, then is closed.
+- **Schema problems.** Unlike the reference (which answers 422), a readable JSON document that fails this server's
+  checks (missing fields, `format` other than 2, ...) is saved and answered **200**, because the game would not send
+  it again; the problems are recorded and shown by `list_race_results`. `get_race_result` refuses a `format` other
+  than 2 (`unsupported_format`) and reports a damaged stored file as `stored_file_unreadable`.
+- **Storage.** In `BC_RESULTS_DIR`, the body **as received** (`<id>.results.json` or `.results.zip`) plus
+  `<id>.headers.json` (the `X-BC-*` headers, receive time, problems). The id is the UTC receive time. Files are 0600,
+  the folder 0700. Each file is written to a temporary name and renamed into place (headers first, results last),
+  so a failed save (disk full, say) answers 500 and leaves nothing behind.
+- **Retention.** The newest `BC_RESULTS_KEEP` (100) uploads are kept: older ones are deleted, oldest first, when the
+  receiver starts and after each saved upload. An upload counts only when both of its files exist. Pruning also
+  deletes leftovers older than 1 h (temp files, headers files without a results file); a results file without
+  headers is not listed and never deleted.
+- **Output.** `get_race_result` returns versions, each session's decision-log header, the classification as
+  uploaded and decision counts; numbers are not rounded. Steam ids (`steam_id`, `host_steam_id`) are included only
+  with `include_steam_ids=true`.
 
-This build was tested only against the 14 packets captured from the game (in `tests/data`, byte-identical to the
-game's `testdata`), the game's reference codec `bc_api.py`, and a fake game (`tests/fake_game.py`). It has **not**
-been run against Backseat Champions itself. To check it:
-
-1. Close anything else listening on 29770 (e.g. `gameapi_client.py listen`). Enable the API with Driver Data, Player
-   Data, Decision Events and Player Input. Optionally run the game's own `python gameapi_client.py validate
-   --seconds 30` first (then close it).
-2. Start a single-player race, connect the server, call `get_api_status`: expect `reachable: true`, no switches off,
-   `receiving: true` and `my_car` set.
-3. Call `get_race_snapshot`, `get_standings`, `get_player_state`, `get_session`; compare with the screen
-   (position, lap, tire health, points, hand).
-4. With points on offer, `wait_for_trigger` should return a `card_offer` matching the hand on screen; `pick_card`
-   should pick it in game. Try `ban_card` with a ban token.
-5. `boost(speed=true, duration_s=3)` and watch `get_car_abilities` (`api_boosting`, `speed_boost`).
-6. Run a long race and watch `get_trigger_config` (tire samples and forecast) until `tires_wont_last` fires; call
-   `set_pit(true)`, then `wait_for_event(codes=["TIRE"])` and `pick_tire`.
-7. Things the documentation leaves open and that are worth watching: whether a `CARD` event repeats after a ban,
-   what the game shows in Car Status when something fails, how `interval_behind`'s sign is meant, and how long the
-   tire screen stays open.
-
-The fake game can also be used by hand: `python tests/fake_game.py --scenario --events` sends telemetry to
-127.0.0.1:29770 and answers commands on 29771 (laps every 20 s, tires wearing 0.2 per lap, a puncture at lap 3).
-
-## Development
+## Testing
 
 ```sh
-pip install mcp pytest   # or: uv pip install -e '.[test]'
-python -m pytest -q
-python3 -m compileall src
-python scripts/gen_tools_doc.py          # regenerates docs/TOOLS.md from the registered tools
+pip install -e '.[test]'       # or: uv pip install -e '.[test]'
+python3 -m pytest -q
+python3 scripts/gen_tools_doc.py  # regenerates docs/TOOLS.md from the registered tools
 ```
 
-The tests decode every captured packet, cross-check the decoder and every command encoder against the game's
-`bc_api.py` (when `BC_UPSTREAM_GAMEAPI` points at the game's `BackseatChampions_Data/GameAPI` folder), unit-test the trigger engine on
-synthetic sequences, and run the server end to end through the MCP client over stdio against the fake game.
+The tests decode the 14 packets captured from the game (`tests/data`), unit-test the trigger engine, and run the
+server end to end over stdio against a fake game (`tests/fake_game.py`; by hand: `python3 tests/fake_game.py
+--scenario --events` sends telemetry to 127.0.0.1:29770 and answers commands on 29771). To also cross-check the
+decoder and command encoders against the game's reference codec, set `BC_UPSTREAM_GAMEAPI` to the game's `GameAPI`
+folder (the one with `bc_api.py`); without it those tests are skipped.
+
+## Known limitations and live-only questions
+
+Tested against captured packets and a fake game; one race was run against game 0.88.2, which is where the pause,
+index re-ordering, `cards_unavailable` in the pit lane and the ~80 s client limit were seen. Still open:
+
+1. Whether the game pauses on every pending hand (assumed; the Player packet decides otherwise, nothing is lost).
+2. Whether events or `frame` advance during a pause (pause detection uses `session_time`).
+3. What `LAPC.lap` means (completed or new lap): not used for counting; see `get_trigger_config`.
+4. Whether Participants is re-sent when the order changes (names of other cars are attached only when exact).
+5. Whether index = position - 1 always holds within one packet (assumed for `"ahead"` / `"behind"`).
+6. Whether `cards_unavailable` only happens in the pit lane (the hand stays open either way).
+7. `packet_version` values other than the README's are dropped and counted in `get_api_status`.
+8. Whether `CARD` repeats after a ban (deduplicated by cards and points).
+9. How the pre-race tire screen closes (resends are bounded either way).
+10. Puncture flags shorter than the sample interval can be missed; a failure during a boost can be missed.
+11. If a client drops a `wait_for_trigger` result despite the 55 s cap, the lost card hand is resent only after 20 s,
+    so the game can stay paused on it for up to about 20 s.
+12. A telemetry packet with a new, never-seen `session_uid` starts a new session in this server. Source filtering
+    applies only off loopback, so on loopback any local process could spoof that.
+13. Last-lap silence and `laps_remaining` need Lap Data (Driver Data) or Player Data. With neither there is no lap
+    count, and `tires_wont_last` can fire on the last lap.
+14. Under an extreme flood of replies on the command port, the liveness ping of `boost` / `drive` can time out
+    and return `no_reply` even though the hold may have started: check `get_car_abilities` (`api_boosting`) or
+    `get_api_status` (holds), or call `stop_boost` / `release_drive`.

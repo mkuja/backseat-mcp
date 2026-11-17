@@ -171,3 +171,43 @@ def test_name_lookup():
     for bad in ("Slick", 7, -1, True):
         with pytest.raises(ValueError):
             P.compound_index(bad)
+
+
+def test_packet_version_mismatch_refused():
+    """README header: packet_version is 2 for AI Observations, 1 for the rest; another layout is not decoded."""
+    for name in NAMES:
+        data = bytearray(load_bin(name))
+        good = data[3]
+        assert good == P.PACKET_LAYOUT_VERSIONS.get(data[2], 1)
+        for wrong in (0, good + 1, 255):
+            data[3] = wrong
+            with pytest.raises(P.PacketVersionError):
+                P.peek_header(bytes(data))
+            with pytest.raises(P.PacketError):
+                P.decode(bytes(data))
+
+
+def test_packet_version_checked_before_size():
+    """V-T1: a new layout has a new packet_version and a new size; it is a version mismatch, not noise. A wrong size
+    at the known version stays a malformed datagram."""
+    player = bytearray(load_bin("player"))
+    player[3] = 2
+    for extra in (40, -100, 0):
+        data = bytes(player) + bytes(max(extra, 0)) if extra >= 0 else bytes(player[:extra])
+        with pytest.raises(P.PacketVersionError):
+            P.peek_header(data)
+    ai = bytearray(load_bin("ai_observations"))
+    assert ai[3] == 2
+    ai3 = bytes(ai[:3]) + bytes([3]) + bytes(ai[4:]) + bytes(8)
+    with pytest.raises(P.PacketVersionError) as info:
+        P.peek_header(ai3)
+    assert "version 3" in str(info.value) and "1440 bytes" in str(info.value)
+    for size in (1428, len(ai) + 8):                    # known version, wrong size: malformed, not a version bump
+        data = bytes(ai[:size]) + bytes(max(0, size - len(ai)))
+        with pytest.raises(P.PacketError) as info:
+            P.peek_header(data)
+        assert not isinstance(info.value, P.PacketVersionError)
+    short = bytes(player[:P.HEADER_SIZE - 1])
+    with pytest.raises(P.PacketError) as info:
+        P.peek_header(short)
+    assert not isinstance(info.value, P.PacketVersionError)

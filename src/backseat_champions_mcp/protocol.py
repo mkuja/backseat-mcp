@@ -44,7 +44,8 @@ PKT_CAR_ABILITIES = 12
 PKT_RACING_LINE = 13
 
 # id -> (name, total datagram bytes, layout version). The README's packet table lists AI Observations as 1,428
-# bytes, but its own field list adds up to 24 + 1,408 = 1,432, which is also what the game sends.
+# bytes, but its own field list adds up to 24 + 1,408 = 1,432. Confirmed live: game 0.88.2 sent 250,584 AI Observations
+# packets of exactly 1,432 bytes in one race, none dropped (Nov 2026).
 PACKETS = {
     PKT_MOTION: ("motion", 792, 1),
     PKT_CAR_TELEMETRY: ("car_telemetry", 952, 1),
@@ -252,8 +253,17 @@ def _header_dict(fields):
     }
 
 
+class PacketVersionError(PacketError):
+    """A known packet with a packet_version this codec does not read."""
+
+
+# Layout version of each packet type (README header: 2 for AI Observations, 1 for the rest).
+PACKET_LAYOUT_VERSIONS = {PKT_AI_OBSERVATIONS: 2}
+
+
 def peek_header(data):
-    """Validate a datagram (length, format, known id, fixed size) and return its header dict without the body.
+    """Validate a datagram (length, format, known id, packet_version, fixed size) and return its header dict
+    without the body. A known id with another packet_version raises :class:`PacketVersionError` whatever its size.
 
     Raises :class:`PacketError` for anything else; a listening UDP socket can receive anything.
     """
@@ -266,6 +276,13 @@ def peek_header(data):
     spec = PACKETS.get(fields[1])
     if spec is None:
         raise PacketError("unknown packet id %d" % fields[1])
+    # The version comes before the size: a new layout has a new packet_version AND (usually) a new size (README:
+    # "Its size in the table above changes with it"), and that must be reported as a version mismatch, not as
+    # noise. A wrong size at the known version is a malformed datagram.
+    expected = PACKET_LAYOUT_VERSIONS.get(fields[1], 1)
+    if fields[2] != expected:
+        raise PacketVersionError("%s packet_version %d (%d bytes), this codec reads version %d (%d bytes)"
+                                 % (spec[0], fields[2], size, expected, spec[1]))
     if size != spec[1]:
         raise PacketError("%s is %d bytes, expected %d" % (spec[0], size, spec[1]))
     return _header_dict(fields)
