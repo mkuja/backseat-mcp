@@ -17,8 +17,8 @@ def test_testdata_complete():
 
 
 def test_testdata_identical_to_upstream():
-    upstream = os.path.join(UPSTREAM, "testdata")
-    if not os.path.isdir(upstream):
+    upstream = os.path.join(UPSTREAM, "testdata") if UPSTREAM else ""
+    if not upstream or not os.path.isdir(upstream):
         pytest.skip("upstream testdata not found")
     for name in NAMES:
         assert filecmp.cmp(os.path.join(DATA, name + ".bin"), os.path.join(upstream, name + ".bin"), shallow=False)

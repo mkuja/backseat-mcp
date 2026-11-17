@@ -51,16 +51,16 @@ Requires Python 3.10 or newer. The only dependency is the official MCP Python SD
 With [uv](https://docs.astral.sh/uv/):
 
 ```sh
-uv tool install /home/mikko/src/backseat_champions_ai-server          # installs the backseat-champions-mcp command
+uv tool install .          # run in the repository folder; installs the backseat-champions-mcp command
 # or run without installing:
-uvx --from /home/mikko/src/backseat_champions_ai-server backseat-champions-mcp --help
+uvx --from . backseat-champions-mcp --help
 ```
 
 With pip:
 
 ```sh
 python -m venv .venv && . .venv/bin/activate
-pip install /home/mikko/src/backseat_champions_ai-server
+pip install .                     # run in the repository folder
 backseat-champions-mcp --help
 ```
 
@@ -76,18 +76,22 @@ The server speaks MCP over **stdio** by default; `--transport streamable-http --
   "mcpServers": {
     "backseat-champions": {
       "command": "uvx",
-      "args": ["--from", "/home/mikko/src/backseat_champions_ai-server", "backseat-champions-mcp"],
+      "args": ["--from", "/path/to/backseat_champions_ai-server", "backseat-champions-mcp"],
       "env": { "BC_TRIGGERS": "card_offer,car_damaged,tires_wont_last" }
     }
   }
 }
 ```
 
+Replace `/path/to/backseat_champions_ai-server` with the absolute path of your copy of this repository: the config
+file does not expand `~`, `$HOME` or relative paths. If the app can't find `uvx`, give its absolute path too
+(`which uvx`).
+
 ### Claude Code
 
 ```sh
 claude mcp add --env BC_WAIT_MAX_S=240 --transport stdio backseat-champions \
-  -- uvx --from /home/mikko/src/backseat_champions_ai-server backseat-champions-mcp
+  -- uvx --from "$PWD" backseat-champions-mcp   # run in the repository folder
 ```
 
 or in `.mcp.json`:
@@ -97,7 +101,7 @@ or in `.mcp.json`:
   "mcpServers": {
     "backseat-champions": {
       "command": "uvx",
-      "args": ["--from", "/home/mikko/src/backseat_champions_ai-server", "backseat-champions-mcp"],
+      "args": ["--from", "/path/to/backseat_champions_ai-server", "backseat-champions-mcp"],
       "env": { "BC_WAIT_MAX_S": "240" },
       "timeout": 300000
     }
@@ -301,5 +305,5 @@ python scripts/gen_tools_doc.py          # regenerates docs/TOOLS.md from the re
 ```
 
 The tests decode every captured packet, cross-check the decoder and every command encoder against the game's
-`bc_api.py` (when found at `/mnt/user-data/uploads/GameAPI` or `BC_UPSTREAM_GAMEAPI`), unit-test the trigger engine on
+`bc_api.py` (when `BC_UPSTREAM_GAMEAPI` points at the game's `BackseatChampions_Data/GameAPI` folder), unit-test the trigger engine on
 synthetic sequences, and run the server end to end through the MCP client over stdio against the fake game.

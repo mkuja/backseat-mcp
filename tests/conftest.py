@@ -9,7 +9,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SRC = os.path.join(ROOT, "src")
 DATA = os.path.join(HERE, "data")
-UPSTREAM = os.environ.get("BC_UPSTREAM_GAMEAPI", "/mnt/user-data/uploads/GameAPI")
+UPSTREAM = os.environ.get("BC_UPSTREAM_GAMEAPI", "")
 
 for path in (SRC, HERE):
     if path not in sys.path:
@@ -32,8 +32,8 @@ def load_bin(name):
 @pytest.fixture(scope="session")
 def bc_api():
     """The game's reference codec, loaded by path; tests that need it skip when it is absent."""
-    path = os.path.join(UPSTREAM, "bc_api.py")
-    if not os.path.exists(path):
+    path = os.path.join(UPSTREAM, "bc_api.py") if UPSTREAM else ""
+    if not path or not os.path.exists(path):
         pytest.skip("reference bc_api.py not found at %s" % path)
     spec = importlib.util.spec_from_file_location("bc_api_reference", path)
     module = importlib.util.module_from_spec(spec)
