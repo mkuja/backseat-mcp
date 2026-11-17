@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "backseat-champions-mcp"
+version = "0.1.0"
+description = "Unofficial MCP server for the Backseat Champions Game API: an LLM as race engineer, woken by triggers."
+readme = "README.md"
+requires-python = ">=3.10"
+# mcp 2.x: FastMCP is called MCPServer there (mcp.server.mcpserver). The server is written against 2.3.
+dependencies = ["mcp>=2.3,<3"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+backseat-champions-mcp = "backseat_champions_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/backseat_champions_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
