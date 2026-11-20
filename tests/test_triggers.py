@@ -18,7 +18,10 @@ def hand(*upgrades, banned=()):
 
 
 class Sim:
-    """Builds decoded packets for one session with my car at index 3 of 6."""
+    """Builds decoded packets for one session with my car at index 3 of 6.
+
+    ``self.lap`` is laps COMPLETED; the packets carry the lap semantics observed in game 0.88.2: Lap Data ``lap`` =
+    the lap being driven (completed + 1) and Player ``laps_remaining`` = laps after the current one."""
 
     def __init__(self, enabled=("card_offer", "car_damaged", "tires_wont_last"), **cfg):
         self.t = 100.0
@@ -57,7 +60,7 @@ class Sim:
 
     def player(self, **kw):
         body = {"seat": 0, "car": self.me, "points": self.points, "hand": self.hand, "upgrades_applied": 0,
-                "total_laps": self.total_laps, "laps_remaining": max(0, self.total_laps - self.lap),
+                "total_laps": self.total_laps, "laps_remaining": max(0, self.total_laps - self.lap - 1),
                 "pit_planned": self.pit_planned, "can_pit": True, "in_pits": self.in_pits, "pit_stops": 0,
                 "tire_compound": self.compound, "puncture": self.puncture, "tire_health": self.health,
                 "compound_picks_left": {c: None for c in P.COMPOUNDS}, "energy": 1.0, "strategy": None}
@@ -65,7 +68,7 @@ class Sim:
         self.engine.feed(P.PKT_PLAYER, self.header(), body)
 
     def lap_data(self):
-        cars = [{"position": i + 1, "class_position": i + 1, "lap": self.lap if i == self.me else 0,
+        cars = [{"position": i + 1, "class_position": i + 1, "lap": self.lap + 1 if i == self.me else 1,
                  "in_pits": self.in_pits if i == self.me else False, "finished": False,
                  "pit_planned": self.pit_planned if i == self.me else False, "api_driving": False, "pit_stops": 0,
                  "gap_to_leader": 0.0, "interval_ahead": 0.0, "interval_behind": 0.0} for i in range(self.n)]
@@ -472,7 +475,7 @@ def test_tire_prediction_fires_on_the_right_lap():
     t = fired[0]
     # health at lap boundary k is 1 - 0.2 k; with 0.2 per lap the end of the next lap is 0.4 below that:
     # first <= 0.05 when k = 3 (0.4 now, 0.0 predicted)
-    assert t["lap"] == 3
+    assert t["laps_completed"] == 3 and t["lap"] == 4 and t["current_lap"] == 4
     assert t["reason"] == "prediction"
     assert t["wear_per_lap"] == pytest.approx(0.2, abs=0.01)
     assert t["predicted_health_end_of_next_lap"] <= 0.05
@@ -634,28 +637,212 @@ def test_laps_remaining_without_player():
     assert laps["lap_source"] == "lap_data" and s.engine.player_at is None
 
 
-def test_lapc_does_not_change_laps():
-    """X9 (L7 adapted): LAPC is a timing hint only; lap = completed + 1 (or = completed) leaves the count alone,
-    and G1 holds in both cases."""
-    for mode in ("completed", "lap_number"):
-        s = new_tire_sim()
-        s.total_laps = 4
-        s.lap = 2
+def raw_lap(s, lap_number):
+    """Packets showing the raw lap number the game sends for the lap being driven (Lap Data lap, LAPC lap)."""
+    s.lap = lap_number - 1
+
+
+def test_lap_counting_observed_0882_eight_lap_race():
+    """Real observation (0.88.2, 8 laps at China, from the server's own lap_observations): LAPC 1 at the start
+    (session time 392.6), LAPC 9 at the flag; Lap Data lap = the current lap, lagging LAPC by one sample, 9 after
+    the flag; Player total_laps - laps_remaining = the current lap. 0.2.0 read Lap Data lap as laps completed: one
+    too many completed, one too few remaining, and 9/8 completed at the end."""
+    s = Sim()
+    s.total_laps = 8
+    s.st = 390.0
+    s.session()
+    raw_lap(s, 1)                      # grid: Lap Data already says lap 1
+    s.lap_data()
+    s.player()
+    assert s.engine.laps()["laps_completed"] == 0
+    s.st = 392.6
+    s.event("LAPC", lap=1, position=8)
+    laps = s.engine.laps()
+    assert (laps["current_lap"], laps["laps_completed"], laps["laps_remaining"]) == (1, 0, 8), laps
+    for n in range(2, 9):
+        s.advance(90.0)
+        s.event("LAPC", lap=n, position=8)          # Lap Data still shows n - 1 (one sample behind)
+        raw_lap(s, n - 1)
         s.lap_data()
-        s.player()
-        s.event("LAPC", lap=3 if mode == "lap_number" else 2, position=1)
-        assert s.engine.lap == 2 and s.engine.laps_remaining == 2
-        obs = s.engine.laps()["lap_observations"][-1]
-        assert obs["lap_data_lap"] == 2 and obs["player_laps_completed"] == 2
-        assert obs["lapc_lap"] == (3 if mode == "lap_number" else 2)
-        # last lap: tires very low, still silent
-        s.lap = 3
-        s.event("LAPC", lap=4 if mode == "lap_number" else 3, position=1)
+        laps = s.engine.laps()
+        assert (laps["current_lap"], laps["laps_completed"], laps["laps_remaining"]) == (n, n - 1, 9 - n), (n, laps)
+        raw_lap(s, n)
         s.lap_data()
-        s.health = 0.02
+        s.player()                                   # raw laps_remaining = 8 - n (laps after the current one)
+        laps = s.engine.laps()
+        assert (laps["current_lap"], laps["laps_completed"], laps["laps_remaining"]) == (n, n - 1, 9 - n), (n, laps)
+    assert s.engine.laps()["final_lap"] is True and s.engine._silenced() == "last lap"
+    s.advance(90.0)
+    s.event("LAPC", lap=9, position=8)
+    s.event("FINI", position=8)
+    raw_lap(s, 9)
+    s.lap_data()
+    laps = s.engine.laps()
+    assert laps["laps_completed"] == 8 and laps["laps_remaining"] == 0 and laps["current_lap"] is None, laps
+    obs = laps["lap_observations"][-1]
+    assert obs["lapc_lap"] == 9 and "observed in 0.88.2" in laps["lap_semantics"]
+
+
+def test_lap_counting_player_only_and_clamped():
+    """Player Data alone: total - laps_remaining = the current lap (laps_remaining 0 on the final lap); values never
+    go beyond total_laps or below 0."""
+    s = Sim()
+    s.total_laps = 8
+    s.player(laps_remaining=8)                      # pre-race oddity: would be -1 completed
+    assert s.engine.laps()["laps_completed"] == 0
+    s.player(laps_remaining=1)                      # driving lap 7
+    laps = s.engine.laps()
+    assert (laps["current_lap"], laps["laps_completed"], laps["laps_remaining"]) == (7, 6, 2), laps
+    s.player(laps_remaining=0)                      # final lap
+    assert s.engine.laps()["laps_remaining"] == 1 and s.engine.laps()["current_lap"] == 8
+    raw_lap(s, 12)
+    s.lap_data()                                    # nonsense above the total: clamped
+    assert s.engine.laps()["laps_completed"] == 8 and s.engine.laps()["laps_remaining"] == 0
+
+
+def test_tires_wont_last_fires_on_lap_7_of_8():
+    """Real observation: in 0.2.0 the last-lap silence started on lap 7 of 8 (Player total - remaining read as
+    completed), so tires_wont_last stayed silent while two laps remained. It must fire on lap 7 and stay silent on
+    lap 8, the final lap."""
+    s = new_tire_sim()
+    s.total_laps = 8
+    raw_lap(s, 7)
+    s.lap_data()
+    s.player()                                       # Lap Data 7, Player laps_remaining 1
+    assert s.engine.laps_remaining == 2 and s.engine._silenced() is None
+    s.health = 0.05
+    for _ in range(3):
+        s.advance(0.1)
         s.player()
-        assert s.engine.laps_remaining == 1 and not s.fired("tires_wont_last")
-        assert "lap_observations" in s.engine.state()
+    assert len(s.fired("tires_wont_last")) == 1
+    t = s.fired("tires_wont_last")[0]
+    assert t["current_lap"] == 7 and t["laps_completed"] == 6 and t["laps_remaining"] == 2
+    s2 = new_tire_sim()
+    s2.total_laps = 8
+    raw_lap(s2, 8)
+    s2.lap_data()
+    s2.player()                                      # Lap Data 8, Player laps_remaining 0: the final lap
+    assert s2.engine.laps_remaining == 1
+    s2.health = 0.05
+    for _ in range(3):
+        s2.advance(0.1)
+        s2.player()
+    assert not s2.fired("tires_wont_last")
+
+
+# ------------------------------------------------------------------------------------------------ pit call verification
+
+def pit_sim():
+    s = new_tire_sim(enabled=("tires_wont_last",))
+    s.total_laps = 8
+    s.st = 455.0
+    raw_lap(s, 1)
+    s.lap_data()
+    s.player()
+    return s
+
+
+def test_pit_call_lost_at_lap_boundary_observed_0882():
+    """Real observation (0.88.2): set_pit(true) Ack at session time 460.5, ~1.5 s before the lap-2 boundary
+    (LAPC / PITW at ~462); afterwards Player pit_planned was false. The server must report pit_call_lost, queue a
+    note and re-arm tires_wont_last, and never re-send anything."""
+    s = pit_sim()
+    s.health = 0.02
+    for _ in range(3):
+        s.advance(0.1)
+        s.player()
+    assert len(s.fired("tires_wont_last")) == 1       # answered below with set_pit(true)
+    s.st = 460.5
+    s.player()
+    s.engine.note_pit_command(True, {"ok": True})
+    assert s.engine.pit_state()["api_call"]["state"] == "pending"
+    s.advance(0.1)
+    s.player()                                        # the game had not shown pit_planned yet
+    s.st = 462.0
+    s.event("LAPC", lap=2, position=8)
+    s.event("PITW", lap=2, pit_planned=False, can_pit=True)
+    assert not s.engine.pit_call_lost                 # Player lags the boundary: not judged yet
+    for _ in range(15):
+        s.advance(0.1)
+        raw_lap(s, 2)
+        s.lap_data()
+        s.player()                                    # pit_planned false
+    ps = s.engine.pit_state()
+    assert ps["pit_call_lost"] is True and ps["api_call"]["state"] == "lost", ps
+    assert ps["api_call"]["pitw_pit_planned"] is False
+    notes = s.engine.take_notes()
+    assert len(notes) == 1 and "pit_call_lost" in notes[0] and "460.5" in notes[0]
+    assert s.engine.take_notes() == []
+    fired = s.fired("tires_wont_last")
+    assert len(fired) == 2 and fired[1]["pit_call_lost"] is True     # re-armed: the model is woken again
+    # a second call after the boundary sticks: lost clears, the plan is the API's
+    s.engine.note_pit_command(True, {"ok": True})
+    s.pit_planned = True
+    s.advance(0.1)
+    s.player()
+    ps = s.engine.pit_state()
+    assert ps["pit_call_lost"] is False and ps["api_call"]["state"] == "confirmed" and ps["pit_planned_by"] == "api"
+    # the car enters the pits: the call did its job
+    s.in_pits = True
+    s.advance(0.1)
+    s.player()
+    assert "api_call" not in s.engine.pit_state()
+
+
+def test_pit_call_confirmed_not_lost_and_cancel_not_lost():
+    """A call that the game keeps (pit_planned true after the boundary) is never lost; nor is a call the API
+    cancelled with set_pit(false)."""
+    s = pit_sim()
+    s.engine.note_pit_command(True, {"ok": True})
+    s.pit_planned = True
+    s.advance(0.1)
+    s.player()
+    s.event("LAPC", lap=2, position=8)
+    for _ in range(20):
+        s.advance(0.1)
+        s.player()
+    assert s.engine.pit_state()["api_call"]["state"] == "confirmed" and not s.engine.pit_call_lost
+    s.engine.note_pit_command(False, {"ok": True})
+    s.pit_planned = False
+    s.event("LAPC", lap=3, position=8)
+    for _ in range(20):
+        s.advance(0.1)
+        s.player()
+    assert not s.engine.pit_call_lost and s.engine.take_notes() == []
+    # a refused call is not verified at all
+    s.engine.note_pit_command(True, {"ok": False, "error_reason": "refused"})
+    assert "api_call" not in s.engine.pit_state()
+
+
+def test_pit_planned_by_game_without_api_call_observed_0882():
+    """Real observation (0.88.2): later in the race pit_planned became true with can_pit false and no API call
+    (the game's own strategy planned the stop): pit_planned_by "game"."""
+    s = pit_sim()
+    assert s.engine.pit_state()["pit_planned_by"] is None
+    s.pit_planned = True
+    s.advance(0.1)
+    s.player(can_pit=False)
+    assert s.engine.pit_state()["pit_planned_by"] == "game"
+    s.engine._tires_armed = True
+    s.health = 0.02
+    s.advance(0.1)
+    s.player(can_pit=False)
+    assert not s.fired("tires_wont_last")              # a stop is planned: silent
+    s.pit_planned = False
+    s.advance(0.1)
+    s.player()
+    assert s.engine.pit_state()["pit_planned_by"] is None
+
+
+def test_car_damaged_payload_has_pit_fields():
+    s = Sim(enabled=("car_damaged",))
+    s.player()
+    s.puncture = True
+    s.health = 0.0                                     # observed 0.88.2: health 0.0 set the puncture flag
+    s.player()
+    s.player()
+    t = s.fired("car_damaged")[0]
+    assert t["pit_planned_by"] is None and t["pit_call_lost"] is False and t["tire_health"] == 0.0
 
 
 def test_extrapolation_uses_session_time_across_pause():
@@ -1087,7 +1274,7 @@ def test_tire_health_noise_one_stint_one_trigger():
         s.lap_data()
     assert s.engine._stint_id == 1
     fired = s.fired("tires_wont_last")
-    assert len(fired) == 1 and fired[0]["lap"] in (7, 8)
+    assert len(fired) == 1 and fired[0]["laps_completed"] in (7, 8)
     assert s.engine.wear_estimate()[0] == pytest.approx(0.1, abs=0.02)
 
 

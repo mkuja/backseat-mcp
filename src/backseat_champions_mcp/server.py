@@ -25,7 +25,7 @@ import time
 import warnings
 from typing import Annotated, Any, List, Optional, Union
 
-from pydantic import Field, Strict
+from pydantic import Field, Strict, StringConstraints
 
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
@@ -43,9 +43,31 @@ log = logging.getLogger("backseat_champions_mcp")
 SInt = Annotated[int, Strict()]
 SStr = Annotated[str, Strict()]
 SFloat = Annotated[float, Strict()]
+# A whole number sent as a JSON string ("1"): a client with a stale cached tool schema sent pick_card seq="1" in
+# a real race (0.88.2 session) and strict validation failed the call. ASCII digits only; bools, floats and other
+# strings are still refused by the schema.
+DigitStr = Annotated[str, Strict(), StringConstraints(pattern=r"^[0-9]{1,9}$")]
+
+
+def as_int(value, name, lo=None, hi=None):
+    """An int argument that may arrive as a numeric string (see DigitStr); range-checked (ValueError)."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("%s must be an integer, got %r" % (name, value))
+    if isinstance(value, str):
+        if not _ASCII_NUMBER.fullmatch(value):
+            raise ValueError("%s must be an integer, got %r" % (name, value))
+        value = int(value)
+    if not isinstance(value, int):
+        raise ValueError("%s must be an integer, got %r" % (name, value))
+    if (lo is not None and value < lo) or (hi is not None and value > hi):
+        raise ValueError("%s must be between %s and %s, got %d" % (name, lo, hi, value))
+    return value
 
 TRIGGERS_URI = "bc://triggers/latest"
 WAIT_EVENT_MAX_S = 60.0
+SET_PIT_CONFIRM_WAIT_S = 0.5  # set_pit(true) waits this long for a sample showing pit_planned
 WAIT_HARD_MAX_S = 60.0       # wait_for_trigger never blocks longer (X3); BC_WAIT_MAX_S can only lower it
 ME_WORDS = ("me", "mine", "self", "player", "")
 _ASCII_NUMBER = re.compile(r"[0-9]+")
@@ -614,7 +636,8 @@ def build_server(config, log_level="WARNING"):
         """The running order: every car sorted by position, with names, laps, gaps and pit state.
 
         Source: Lap Data packet (id 2; at the configured rate; needs Driver Data), names from Participants.
-        Per row: position (overall, from 1), class_position, car, name, car_type, kind, laps (laps completed),
+        Per row: position (overall, from 1), class_position, car, name, car_type, kind, lap (the lap being driven:
+        Lap Data lap, observed in 0.88.2; the game README says "laps completed"), laps_completed (lap - 1),
         gap_to_leader_s, interval_ahead_s, interval_behind_s (seconds; the game does not document the sign of
         interval_behind and real captures show it negative, so read it as a magnitude), pit_stops, in_pits
         (in the pit lane), finished, pit_planned (only ever true for this machine's cars: a rival's call is never
@@ -632,7 +655,8 @@ def build_server(config, log_level="WARNING"):
         for i, c in enumerate(body["cars"]):
             row = {"position": c["position"], "class_position": c["class_position"]}
             row.update(label(i, info))
-            row.update(laps=c["lap"], gap_to_leader_s=c["gap_to_leader"], interval_ahead_s=c["interval_ahead"],
+            row.update(lap=c["lap"], laps_completed=max(0, c["lap"] - 1),
+                       gap_to_leader_s=c["gap_to_leader"], interval_ahead_s=c["interval_ahead"],
                        interval_behind_s=c["interval_behind"], pit_stops=c["pit_stops"], in_pits=c["in_pits"],
                        finished=c["finished"], pit_planned=c["pit_planned"], api_driving=c["api_driving"])
             rows.append(row)
@@ -664,7 +688,8 @@ def build_server(config, log_level="WARNING"):
         Source: Car Telemetry packet (id 1; at the configured rate; needs Driver Data). Per car: speed_kmh,
         pedal (-1 full brake to 1 full throttle, as applied), steer (-1 left to 1 right, as applied),
         tire_compound (Standard, Boost, Experimental, Fast, Durable, Wet, Golden), tire_health (1 new, 0 worn
-        out), puncture, energy (boost or fuel left, 0 to 1; energy_kind says which), wheels_on_track and
+        out; observed in 0.88.2: a worn-out tire, health 0.0, sets the puncture flag), puncture, energy (boost or
+        fuel left, 0..1 at the base capacity; can exceed 1 with capacity upgrades (BoostCapacity cards; observed up to ~3.7); energy_kind says which), wheels_on_track and
         wheels_grounded (count of 4), and with include_wheels the per-wheel data (slip's unit and scale are not
         documented by the game; it is 0 while off the ground).
         """
@@ -793,12 +818,19 @@ def build_server(config, log_level="WARNING"):
     def player_view(body, include_blocks):
         out = {"seat": body["seat"], "car": body["car"], "points": body["points"], "hand": body["hand"],
                "upgrades_applied": body["upgrades_applied"], "total_laps": body["total_laps"],
-               "laps_remaining": body["laps_remaining"],
+               "laps_after_current": body["laps_remaining"],
                "pit": {"pit_planned": body["pit_planned"], "can_call_now": body["can_pit"],
                        "in_pits": body["in_pits"], "pit_stops": body["pit_stops"]},
                "tires": {"compound": body["tire_compound"], "health": body["tire_health"],
                          "puncture": body["puncture"], "compound_picks_left": body["compound_picks_left"]},
                "energy": body["energy"], "energy_kind": energy_kind()}
+        total, after = body["total_laps"], body["laps_remaining"]
+        if total:
+            # observed in 0.88.2: the Player packet's laps_remaining counts the laps AFTER the current one
+            current = max(1, min(total, total - after))
+            out.update(current_lap=current, laps_completed=current - 1, laps_remaining=total - current + 1)
+        else:
+            out.update(current_lap=None, laps_completed=None, laps_remaining=None)
         strat = body["strategy"]
         if strat is None:
             out["strategy"] = None
@@ -826,10 +858,13 @@ def build_server(config, log_level="WARNING"):
 
         Source: Player packet (id 4) for seat 0 (at the configured rate; needs Player Data). Returns:
         points (upgrade points to spend), hand (cards on offer: index 0..3 as pick_card/ban_card take it,
-        upgrade, facility, tier, banned), upgrades_applied, total_laps, laps_remaining, pit {pit_planned,
-        can_call_now (a stop can be called now), in_pits, pit_stops}, tires {compound, health (1 new..0 worn),
-        puncture, compound_picks_left (per compound; null = no limit)}, energy (0..1, fuel or boost per
-        energy_kind), strategy (null when the seat has no strategy model): start_grid_position, laps_since_pit,
+        upgrade, facility, tier, banned), upgrades_applied, total_laps, laps_after_current (the packet's own
+        laps_remaining field: observed in 0.88.2 it counts the laps after the current one, 0 on the final lap),
+        current_lap (total_laps - laps_after_current), laps_completed (current_lap - 1), laps_remaining (laps still
+        to finish, the current one included: 1 on the final lap; same meaning as in get_race_snapshot), pit
+        {pit_planned, can_call_now (a stop can be called now), in_pits, pit_stops}, tires {compound, health (1
+        new..0 worn; observed: a worn-out tire at 0.0 punctures), puncture, compound_picks_left (per compound; null
+        = no limit)}, energy (0..1 at the base capacity; can exceed 1 with capacity upgrades (BoostCapacity cards; observed up to ~3.7); fuel or boost per energy_kind), strategy (null when the seat has no strategy model): start_grid_position, laps_since_pit,
         tire_age_laps, cars_within_5s_ahead/behind, class_position, class_size, class_gap_to_leader/ahead/behind
         (seconds, inferred from the field names), reference_lap_s (seconds).
         """
@@ -860,8 +895,12 @@ def build_server(config, log_level="WARNING"):
         - tire_screen: open, pre_race, current, allowed compounds, picks_left (null = no limit), seq. Closed by a
           successful pick_tire, leaving the pit lane, the car driving off the grid, or the session ending.
           Answer with pick_tire(compound).
-        - pit: pit_planned, can_call_now, in_pits (Player packet), and the latest PITW event (sent each new lap).
-          Answer with set_pit(true/false).
+        - pit: pit_planned, can_call_now, in_pits (Player packet), the latest PITW event (sent each new lap),
+          pit_planned_by ("api": planned while a set_pit(true) of yours was pending; "game": the game's own
+          strategy planned it without an API call), pit_call_lost (true: your acknowledged set_pit(true) was
+          dropped by the game at the next lap boundary, seen in 0.88.2 for a call ~1.5 s before the line; call
+          set_pit(true) again if you still want the stop) and api_call (the verification of your last call:
+          pending / confirmed / lost). Answer with set_pit(true/false).
         - paused: present while the game is paused (it pauses while a card hand waits).
         """
         out = {"ok": True}
@@ -879,6 +918,12 @@ def build_server(config, log_level="WARNING"):
                           "in_pits": body["in_pits"], "age_s": round(age, 2)}
         if client.pit_event is not None:
             out.setdefault("pit", {})["last_pit_window_event"] = client.public_event(client.pit_event)
+        ps = engine.pit_state()
+        if got is not None or ps.get("api_call") or ps.get("pit_planned_by"):
+            pit = out.setdefault("pit", {})
+            pit.update(pit_planned_by=ps["pit_planned_by"], pit_call_lost=ps["pit_call_lost"])
+            if ps.get("api_call"):
+                pit["api_call"] = ps["api_call"]
         paused = paused_info()
         if paused:
             out["paused"] = paused
@@ -1096,6 +1141,8 @@ def build_server(config, log_level="WARNING"):
         """Compact race context for trigger results and the snapshot (G8: laps, points and hand from the trigger
         engine, so they agree with the triggers)."""
         ctx_out = {}
+        # my_car from the same Lap Data packet as position / car_ahead / car_behind (the game re-orders indices by
+        # position, so the newest packet of another type can disagree); the newest packet's only without Lap Data
         ctx_out["my_car"] = client.my_car()
         paused = paused_info()
         if paused:
@@ -1111,6 +1158,7 @@ def build_server(config, log_level="WARNING"):
         if lap is not None and lap_me is not None and lap_me < len(lap[1]["cars"]):
             cars = lap[1]["cars"]
             c = cars[lap_me]
+            ctx_out["my_car"] = lap_me
             ctx_out.update(position=c["position"], gap_to_leader_s=c["gap_to_leader"],
                            interval_ahead_s=c["interval_ahead"], interval_behind_s=c["interval_behind"],
                            in_pits=c["in_pits"], finished=c["finished"], pit_stops=c["pit_stops"])
@@ -1128,8 +1176,11 @@ def build_server(config, log_level="WARNING"):
             ctx_out["car_index_note"] = ("car indices are valid for this instant only; use car=\"ahead\" / \"behind\" "
                                          "in the query tools")
         laps = engine.laps()
-        ctx_out.update(laps_completed=laps.get("laps_completed"), total_laps=laps.get("total_laps"),
-                       laps_remaining=laps.get("laps_remaining"), lap_source=laps.get("lap_source"))
+        ctx_out.update(current_lap=laps.get("current_lap"), laps_completed=laps.get("laps_completed"),
+                       total_laps=laps.get("total_laps"), laps_remaining=laps.get("laps_remaining"),
+                       lap_source=laps.get("lap_source"))
+        if laps.get("final_lap"):
+            ctx_out["final_lap"] = True
         ended = session_ended_info()
         if ended:
             ctx_out["session_ended"] = True
@@ -1139,7 +1190,7 @@ def build_server(config, log_level="WARNING"):
                                     "(session_time is not advancing)")
         lapc = next((e for e in reversed(client.events) if e["code"] == "LAPC" and e["seat"] == 0), None)
         if lapc is not None:
-            # a timing hint only: the README does not say whether LAPC's lap is laps completed or the new lap
+            # LAPC's lap = the lap now being driven (observed 0.88.2)
             ctx_out["last_lap_event"] = {"lap": lapc.get("lap"), "position": lapc.get("position"),
                                          "age_s": round(time.monotonic() - lapc["_received"], 1)}
         cs = engine.card_state()
@@ -1155,6 +1206,11 @@ def build_server(config, log_level="WARNING"):
                                  "puncture": b["puncture"]},
                            energy=b["energy"], pit_planned=b["pit_planned"], can_pit=b["can_pit"])
             ctx_out["player_data_age_s"] = round(pl[2], 2)
+        ps = engine.pit_state()
+        if ps.get("pit_planned_by"):
+            ctx_out["pit_planned_by"] = ps["pit_planned_by"]
+        if ps.get("pit_call_lost"):
+            ctx_out["pit_call_lost"] = True
         else:
             tel = client.latest(P.PKT_CAR_TELEMETRY)
             tme = None if tel is None else tel[0]["seat_car"][0]
@@ -1172,10 +1228,14 @@ def build_server(config, log_level="WARNING"):
 
         Combines Session, Lap Data, Participants, Player and Car Telemetry (whichever are switched on) with the
         trigger engine's state: session type/scene/total_laps/weather/energy_kind, position, gaps (seconds; see
-        get_standings about interval_behind's sign), laps_completed / total_laps / laps_remaining with lap_source
-        and lap_data_age_s (labelled frozen while the game is paused), car_ahead / car_behind (car index valid for
-        this instant only, name when known, selector "ahead" / "behind" to use with the query tools), tire
-        (compound, health 1..0, puncture), energy (0..1), points, pit_planned, can_pit, in_pits; plus the open
+        get_standings about interval_behind's sign), current_lap (the lap being driven) / laps_completed /
+        total_laps / laps_remaining (laps still to finish, the current one included: 1 on the final lap, which also
+        sets final_lap) with lap_source and lap_data_age_s (labelled frozen while the game is paused; lap meanings
+        observed in 0.88.2, the game README says Lap Data lap is laps completed), my_car / position / car_ahead /
+        car_behind all from the same Lap Data packet (car index valid for this instant only, name when known,
+        selector "ahead" / "behind" to use with the query tools), tire (compound, health 1..0, puncture), energy
+        (0..1 at the base capacity; can exceed 1 with capacity upgrades (BoostCapacity cards; observed up to ~3.7)), points, pit_planned, pit_planned_by ("api" / "game"), pit_call_lost (your acknowledged set_pit(true)
+        was dropped at the lap boundary), can_pit, in_pits; plus the open
         decisions (card hand, tire screen), the tire-wear forecast of the trigger engine, paused, and running
         boost/drive holds.
         """
@@ -1230,8 +1290,9 @@ def build_server(config, log_level="WARNING"):
     def _wait_note(entries):
         types = [e.get("type") for e in entries]
         if "card_offer" in types and any(e.get("type") == "tire_screen" and e.get("open") for e in entries):
-            return ("tire screen open in the pit lane: pick_tire before pick_card (a pick was seen refused with "
-                    "cards_unavailable while the tire screen was open, 0.88.2); the hand stays open")
+            return ("tire screen open in the pit lane: pick_tire, then pick_card. If pick_card is refused with "
+                    "cards_unavailable: the game stays paused until a card is picked; retry pick_card after a few "
+                    "seconds - do not wait for the pit exit (0.88.2)")
         return None
 
     @tool(WAIT)
@@ -1257,24 +1318,29 @@ def build_server(config, log_level="WARNING"):
           ban_tokens, in_pits, open). From the CARD event; from the Player packet when Decision Events is off,
           and also with it on when no CARD event announced a hand the Player packet shows for 2 s.
           Answer at once with pick_card(index, seq) (ban_card(index, seq) first if wanted): the game stops time
-          while a hand waits. In the pit lane a pick was seen refused with cards_unavailable (0.88.2): pick the
-          tire first; the hand stays open.
+          while a hand waits. In the pit box a pick was seen refused with cards_unavailable (0.88.2): the game
+          stays paused until a card is picked; retry pick_card after a few seconds - do not wait for the pit exit.
         - tire_screen: the tire selection screen opened (pre_race, current, allowed, picks_left): pick_tire.
         - car_damaged: signal "puncture" (definite: two consecutive samples show the puncture flag) or
           "performance_drop"
           (heuristic: performance areas of your car fell suddenly while the field's did not and no ability was
-          active; heuristic=true). Payload includes can_pit, pit_planned, in_pits, laps_remaining.
+          active; heuristic=true). Payload includes can_pit, pit_planned, pit_planned_by, pit_call_lost, in_pits,
+          laps_remaining. Observed in 0.88.2: worn-out tires (health 0.0) puncture.
         - tires_wont_last (heuristic forecast): tire health is predicted to fall to BC_TIRE_MARGIN (0.05) or below
           by the end of the NEXT lap (or is at/below BC_TIRE_FLOOR when there is no forecast). Payload:
-          tire_health, wear_per_lap and how it was derived, predicted_health_end_of_next_lap, laps_remaining,
-          can_pit, pit_planned, compound, compound_picks_left, pit_lane_time_loss_s. Silent on the last lap, in
-          the pit lane, after the flag or when a stop is already called.
+          tire_health, wear_per_lap and how it was derived, predicted_health_end_of_next_lap, current_lap,
+          laps_completed, laps_remaining (laps still to finish, the current one included), can_pit, pit_planned,
+          pit_planned_by, pit_call_lost, compound, compound_picks_left, pit_lane_time_loss_s. Silent on the final
+          lap (laps_remaining 1), in the pit lane, after the flag or when a stop is already called; re-armed when
+          your set_pit(true) is found lost. Observed in 0.88.2: a tire worn to health 0.0 punctures.
         - session_ended: the session is over for you (SEND, or FINI for seat 0; code, position); one per session,
           kept even when the next session starts first.
         Result: {status: "triggered" | "session_ended" | "timeout", triggered, triggers: [{seq, type, age_s,
-        resent, open, lap, ...payload}] oldest first, last_seq (pass it as since_seq next time, after acting),
-        skipped, open_decisions (the open card hand / tire screen right now, on every result), context (position,
-        laps, gaps, car_ahead/behind, tire, energy, points, paused, ...), notes}. Sends MCP progress
+        resent, open, lap (the lap being driven), laps_completed, ...payload}] oldest first, last_seq (pass it as
+        since_seq next time, after acting), skipped, open_decisions (the open card hand / tire screen right now, on
+        every result), context (position, laps, gaps, car_ahead/behind, tire, energy, points, pit_call_lost,
+        paused, ...), notes (including a pit_call_lost note once when your set_pit(true) was dropped by the game at
+        the lap boundary: the server never re-sends it)}. Sends MCP progress
         notifications while waiting. The server never sends a gameplay command on its own (only the read-only
         hello): nothing happens unless you call a command.
         """
@@ -1350,6 +1416,7 @@ def build_server(config, log_level="WARNING"):
         paused = paused_info()
         if paused:
             out["paused"] = paused
+        notes = notes + engine.take_notes()
         if notes:
             out["notes"] = notes
         out["context"] = snapshot_context()
@@ -1378,6 +1445,7 @@ def build_server(config, log_level="WARNING"):
         note = _wait_note(rows)
         if note:
             notes = notes + [note]
+        notes = notes + engine.take_notes()
         if any(e.get("resent") for e in rows):
             notes = notes + ["Entries marked resent were returned before and are not acknowledged; a decision "
                              "still open (open: true or null) needs an answer now."]
@@ -1399,7 +1467,8 @@ def build_server(config, log_level="WARNING"):
         """Recent triggers kept by the server, without waiting and without changing what wait_for_trigger returns.
 
         Each: seq, type (card_offer, car_damaged, tires_wont_last, tire_screen, session_ended), age_s, superseded,
-        open (decisions: true / false / null = unknown), lap, session_time_s and the payload described in
+        open (decisions: true / false / null = unknown), lap (the lap being driven), laps_completed,
+        session_time_s and the payload described in
         wait_for_trigger. Entries of an earlier session are kept (marked stale_session) until the queue's size
         limit; sequence numbers only increase within this server process. Also: last_seq, acked_up_to_seq (the
         highest since_seq passed to wait_for_trigger), open_decisions.
@@ -1417,8 +1486,9 @@ def build_server(config, log_level="WARNING"):
         Returns enabled triggers, thresholds (tire_margin, tire_floor, perf_drop, perf_window_s; all tunable
         heuristics of this server, not game values) and state: which source card offers come from (CARD event or
         Player fallback), the card and tire-screen state, puncture flag and arming, alarmed performance areas,
-        the lap count and its source with the last lap observations (LAPC lap vs Lap Data vs Player, to settle
-        what LAPC's lap means), and the tire forecast (current health, per-lap wear samples on this tire set,
+        the lap count (current_lap, laps_completed, laps_remaining, lap_semantics: observed in 0.88.2, Lap Data /
+        LAPC lap = the lap being driven) and its source with the last lap observations (LAPC lap vs Lap Data vs
+        Player), the pit call verification (pit_planned_by, pit_call_lost, api_call), and the tire forecast (current health, per-lap wear samples on this tire set,
         wear_per_lap and how it was derived, lap time and its source, predicted health at the end of the next
         lap, armed / silenced reason; the floor only fires when there is no forecast).
         """
@@ -1430,11 +1500,10 @@ def build_server(config, log_level="WARNING"):
 
     # ================================================================== commands
 
-    CARD_SEQ_DESC = ("The seq of the card_offer trigger you are answering (optional). If the hand on offer is no "
-                     "longer that trigger's hand, the command is refused with hand_changed and the current hand is "
-                     "returned, so a stale index never picks the wrong card.")
-    CARDS_UNAVAILABLE_HINT = ("Seen in 0.88.2 in the pit lane: pick_tire first (if the tire screen is open) or retry "
-                              "after the car leaves the pit lane (PITO). The hand stays open.")
+    CARD_SEQ_DESC = ("The seq of the card_offer trigger you are answering (optional; a numeric string is accepted). "
+                     "If the hand on offer is no longer that trigger's hand, the command is refused with hand_changed "
+                     "and the current hand is returned, so a stale index never picks the wrong card.")
+    CARDS_UNAVAILABLE_HINT = R.CARDS_UNAVAILABLE_HINT
 
     def check_hand(seq, command):
         """None when the pick / ban may go ahead, else the hand_changed refusal (X11)."""
@@ -1452,24 +1521,27 @@ def build_server(config, log_level="WARNING"):
     @tool(_write(True, False, "Pick an upgrade card"))
     async def pick_card(
             ctx: Context,
-            index: Annotated[int, Field(strict=True, ge=0, le=3, description="Card index in the current hand, 0..3 (the `index` "
-                                                                "field of the hand in the card_offer trigger, "
-                                                                "get_pending_decisions or get_player_state).")],
-            seq: Annotated[Optional[SInt], Field(ge=0, description=CARD_SEQ_DESC)] = None,
+            index: Annotated[Union[Annotated[int, Strict(), Field(ge=0, le=3)], DigitStr], Field(
+                description="Card index in the current hand, 0..3 (the `index` field of the hand in the card_offer "
+                            "trigger, get_pending_decisions or get_player_state). A numeric string is accepted.")],
+            seq: Annotated[Optional[Union[Annotated[int, Strict(), Field(ge=0)], DigitStr]],
+                           Field(description=CARD_SEQ_DESC)] = None,
     ) -> dict:
         """Pick a card from the hand on offer, spending one upgrade point (command pick_card, id 2, seat 0).
 
         Pass seq (the card_offer trigger's seq) so a hand that changed meanwhile is refused with hand_changed
         (the current hand is returned) instead of picking whatever card now has that index. Needs Player Input,
         points > 0 and a card that is not banned. The game answers Ack or Error; possible errors: no_points,
-        invalid_index, cards_unavailable (observed in 0.88.2 while the car was in the pit lane with a hand on
-        offer: pick the tire first or retry after the pit lane; the hand stays open), card_banned,
+        invalid_index, cards_unavailable (observed in 0.88.2 for a hand that arrived while the car was in the pit
+        box: the game stays paused until a card is picked, so there is no pit exit to wait for; retry pick_card
+        after a few seconds, the same pick succeeded later; the hand stays open), card_banned,
         input_disabled, public_lobby, no_player. The game stops time while a hand waits, so answer promptly. On
         no_reply the outcome is unknown: check get_pending_decisions before retrying.
         Returns {ok, picked: the card as last seen in the hand (when known)} or {ok: false, error_reason,
         explanation, hint}. After a pick the game may offer a new hand (a new card_offer trigger) while points
         remain.
         """
+        index, seq = as_int(index, "index", 0, 3), as_int(seq, "seq", 0)
         refused = check_hand(seq, "pick_card")
         if refused:
             return refused
@@ -1490,8 +1562,10 @@ def build_server(config, log_level="WARNING"):
     @tool(_write(True, False, "Ban an upgrade card"))
     async def ban_card(
             ctx: Context,
-            index: Annotated[int, Field(strict=True, ge=0, le=3, description="Card index in the current hand, 0..3.")],
-            seq: Annotated[Optional[SInt], Field(ge=0, description=CARD_SEQ_DESC)] = None,
+            index: Annotated[Union[Annotated[int, Strict(), Field(ge=0, le=3)], DigitStr], Field(
+                description="Card index in the current hand, 0..3. A numeric string is accepted.")],
+            seq: Annotated[Optional[Union[Annotated[int, Strict(), Field(ge=0)], DigitStr]],
+                           Field(description=CARD_SEQ_DESC)] = None,
     ) -> dict:
         """Ban a card in the current hand, spending one ban token (command ban_card, id 7, seat 0).
 
@@ -1501,6 +1575,7 @@ def build_server(config, log_level="WARNING"):
         left to pick, or a card that can't be banned), invalid_index, input_disabled, public_lobby, no_player.
         Ban tokens left: get_car_abilities / get_pending_decisions (ban_tokens).
         """
+        index, seq = as_int(index, "index", 0, 3), as_int(seq, "seq", 0)
         refused = check_hand(seq, "ban_card")
         if refused:
             return refused
@@ -1517,8 +1592,36 @@ def build_server(config, log_level="WARNING"):
         first: a call the car can't make is refused with `refused`. Other errors: input_disabled, public_lobby,
         no_player. When the car enters the pits the tire screen opens (a tire_screen trigger from
         wait_for_trigger): then use pick_tire. The game does not document what it fits if no compound is picked.
+        An Ack only means the game received the command: in 0.88.2 a call acknowledged ~1.5 s before a lap
+        boundary was dropped by the game at the boundary (a second call after it stuck). So the result carries
+        confirmed (true once a Player / Lap Data sample shows pit_planned; the server waits up to 0.5 s for one)
+        and the server keeps verifying: if pit_planned is false after the next lap boundary and you did not cancel,
+        pit_call_lost: true appears in get_pending_decisions, get_race_snapshot and trigger contexts, the next
+        wait_for_trigger result carries a note and tires_wont_last is re-armed. The server never re-sends the call.
         """
-        return await client.set_pit(pit)
+        result = await client.set_pit(pit)
+        engine.note_pit_command(pit, result)
+        if not result.get("ok"):
+            return result
+        if pit:
+            deadline = time.monotonic() + SET_PIT_CONFIRM_WAIT_S
+            while time.monotonic() < deadline and engine.pit_state().get("api_call", {}).get("state") == "pending":
+                await asyncio.sleep(0.05)
+            state = engine.pit_state()
+            call = state.get("api_call") or {}
+            result["confirmed"] = call.get("state") == "confirmed" or bool(state.get("pit_planned"))
+            result["pit_planned_now"] = state.get("pit_planned")
+            if not result["confirmed"]:
+                result["note"] = ("Acknowledged, but not confirmed yet: no Player / Lap Data sample has shown "
+                                  "pit_planned since (the game may be paused, or the sample is still to come). A call "
+                                  "just before a lap boundary was seen dropped by the game in 0.88.2: check "
+                                  "get_pending_decisions (pit.pit_planned, pit.pit_call_lost) after the next lap "
+                                  "boundary.")
+            else:
+                result["note"] = ("pit_planned is showing. A call just before a lap boundary was seen dropped by the "
+                                  "game at the boundary in 0.88.2; the server keeps watching and reports "
+                                  "pit_call_lost if that happens.")
+        return result
 
     @tool(_write(True, False, "Pick a tire compound"))
     async def pick_tire(

@@ -163,8 +163,9 @@ def test_lax_types_refused():
     mcp = build_server(Config(allow_drive=True, command_timeout=0.05))
     for name, args in (("pick_tire", {"compound": True}), ("pick_card", {"index": True}),
                        ("set_pit", {"pit": "yes"}), ("drive", {"pedal": True, "steer": 0.0}),
-                       ("ban_card", {"index": "1"}), ("wait_for_trigger", {"timeout_s": True}),
-                       ("pick_card", {"index": 0, "seq": "3"})):
+                       ("ban_card", {"index": "1.0"}), ("wait_for_trigger", {"timeout_s": True}),
+                       ("pick_card", {"index": 0, "seq": "3x"}), ("pick_card", {"index": 0, "seq": True})):
+        # (numeric strings such as seq="3" are accepted since 0.2.1: a stale client schema sent them in a real race)
         out = call(mcp, name, args)
         assert "_exception" in out or out.get("_is_error") or "validation" in json.dumps(out).lower(), (name, out)
         assert out.get("ok") is not True, (name, out)

@@ -31,8 +31,8 @@ these conditions:
     lap comes from my car's tire health at lap boundaries on the current tire set (median of the last three laps);
     the current lap is also extrapolated (from a fresh baseline, at least ``min_lap_share`` of a lap) and the higher
     of the two is used. All of it runs on the packets' ``session_time``, which stops while the game is paused.
-    Silent when the car finished, is on its last lap (session has a lap count and laps_remaining <= 1), is in the
-    pit lane, or a stop is already called. The last-lap silence needs Lap Data or Player Data (without either there
+    Silent when the car finished, is on its final lap (session has a lap count and laps_remaining <= 1, i.e. the
+    lap being driven is the last one), is in the pit lane, or a stop is already called. The last-lap silence needs Lap Data or Player Data (without either there
     is no lap count). Tire health is smoothed (median of the last 5 samples) and a new tire set is recognised only
     from a pit exit, a compound change or a large (>= 0.15), sustained rise of health; noise never starts one.
 ``tire_screen``
@@ -41,9 +41,23 @@ these conditions:
     Always queued (not configurable): SEND, or FINI for seat 0, once per session; a synthetic one (code null, reason
     ``new_session_started``) when a new session starts before the old one reported its end.
 
-Laps: ``laps_completed`` is the maximum of Lap Data ``lap`` (my car by the packet's own seat_car[0]) and Player
-``total_laps - laps_remaining``, monotone within a session; ``laps_remaining = total_laps - laps_completed``. The LAPC
-event's ``lap`` is ambiguous (completed laps or the new lap's number) and is only recorded (``lap_observations``).
+Laps (observed in game 0.88.2; the game README says Lap Data ``lap`` is "laps completed", which is wrong there): Lap
+Data ``lap``, the LAPC event's ``lap`` and Player ``total_laps - laps_remaining`` are all the number of the lap being
+driven (LAPC 1 at the start, 9 at the flag of an 8-lap race; Player ``laps_remaining`` counts the laps after the
+current one, 0 on the final lap). ``laps_completed`` is the maximum of ``lap - 1`` (Lap Data, my car by the packet's
+own seat_car[0]), ``LAPC lap - 1`` and Player ``total_laps - laps_remaining - 1``, clamped to 0..total_laps and
+monotone within a session; FINI for seat 0 completes the race. ``current_lap = laps_completed + 1`` (None once the
+race is done); ``laps_remaining = total_laps - laps_completed`` = laps still to finish, the current one included (1
+on the final lap).
+
+Pit call verification (observed in 0.88.2: a set_pit(true) acknowledged ~1.5 s before a lap boundary was dropped by
+the game at the boundary; a later call stuck; and the game's own strategy can plan a stop by itself): after a
+successful set_pit(true) the call stays ``pending`` until a Player / Lap Data sample shows pit_planned
+(``confirmed``). If, ``PIT_VERIFY_ST`` session seconds after the next lap boundary (lap count, LAPC or PITW), a sample
+shows pit_planned false while the car has not entered the pit lane and the API did not cancel, the call is ``lost``:
+``pit_call_lost`` is reported, a note is queued for the next wait_for_trigger result and tires_wont_last is re-armed.
+The server never re-sends set_pit. ``pit_planned_by`` is "api" when pit_planned rose with an API call pending, else
+"game".
 
 Delivery (``collect``): at-least-once with a cursor the model acknowledges with ``since_seq``, plus at most
 ``MAX_RESEND`` rate-limited (``REMIND_S``) resends of open decisions. Entries that are superseded, belong to an old
@@ -89,6 +103,8 @@ PUNCTURE_REARM_ST = 3.0     # session seconds the flag must be clear before a ne
 TIRE_MOVING_KMH = 5.0       # pre-race tire screen closes when my car moves faster than this ...
 TIRE_MOVING_ST = 1.0        # ... for this many session seconds
 LAP_OBSERVATIONS = 10
+PIT_VERIFY_ST = 1.0         # session seconds after the lap boundary following a pit call before pit_planned=false
+                            # counts as a lost call (Lap Data / Player lag the boundary by a sample)
 EVICTED_MEMORY = 1000
 
 
@@ -207,16 +223,20 @@ class TriggerEngine:
         self.session_time = None
         self.frame = None
         self.total_laps = None       # Session / Player; 0 = no lap count
-        self.laps_remaining = None   # total_laps - laps_completed (total > 0)
-        self.lap = None              # laps completed (Lap Data / Player), monotone in a session
+        self.laps_remaining = None   # total_laps - laps_completed: laps still to finish, current one included
+        self.lap = None              # laps COMPLETED (Lap Data lap - 1, LAPC - 1, Player), monotone in a session
         self.lap_source = None
-        self._lapdata_lap = None
+        self._lapdata_lap = None     # raw Lap Data lap of my car (= the lap being driven, observed 0.88.2)
         self._lapdata_wall = None
-        self._player_completed = None
+        self._player_remaining = None   # raw Player laps_remaining (= laps after the current one)
+        self._lapc_lap = None        # raw LAPC lap (= the lap now being driven)
         self.lap_observations = collections.deque(maxlen=LAP_OBSERVATIONS)
         self.finished = False
         self.in_pits = None
         self.pit_planned = None
+        self.pit_planned_by = None   # "api" | "game" while pit_planned is true
+        self._pit_call = None        # the last acknowledged set_pit(true) being verified
+        self._pit_notes = []         # notes for the next wait_for_trigger result
         self.can_pit = None
         self.health = None           # median of the last HEALTH_SMOOTH samples on the current tire set
         self.health_raw = None
@@ -343,8 +363,9 @@ class TriggerEngine:
         if total is not None:
             self.total_laps = total
         if total and body.get("laps_remaining") is not None:
-            self._player_completed = max(0, total - body["laps_remaining"])
-            self._set_lap(self._player_completed, now, "player")
+            # laps_remaining = laps AFTER the current one (observed 0.88.2): completed = total - remaining - 1
+            self._player_remaining = body["laps_remaining"]
+            self._set_lap(total - body["laps_remaining"] - 1, now, "player")
         self._update_laps_remaining()
         self._player_cards(body["points"], body["hand"], now)
         self._eval_tires(now)
@@ -370,7 +391,7 @@ class TriggerEngine:
             self._set_pits(c["in_pits"], c["pit_planned"], now)
         self._lapdata_lap = c["lap"]
         self._lapdata_wall = now
-        self._set_lap(c["lap"], now, "lap_data")
+        self._set_lap(c["lap"] - 1, now, "lap_data")      # lap = the lap being driven (observed 0.88.2)
         self._update_laps_remaining()
         self._eval_tires(now)
 
@@ -402,6 +423,9 @@ class TriggerEngine:
         code, seat = body.get("code"), body.get("seat")
         if code == "SEND" or (code == "FINI" and seat == 0):
             self.finished = self.finished or code == "FINI"
+            if code == "FINI" and self.total_laps:
+                self._set_lap(self.total_laps, now, "fini")
+            self._update_laps_remaining()
             self._close_tire("session ended" if code == "SEND" else "finished")
             if self._ended:
                 return               # FINI then SEND (or a repeat): one session_ended per session
@@ -416,13 +440,21 @@ class TriggerEngine:
         elif code == "TIRE":
             self._tire_open(body, now)
         elif code == "LAPC":
-            # Ambiguous meaning (laps completed vs the new lap's number): a timing hint only, never a lap count.
+            # LAPC's lap = the lap now being driven (observed 0.88.2: 1 at the start, total + 1 at the flag)
             self.lap_observations.append({"lapc_lap": body.get("lap"), "lap_data_lap": self._lapdata_lap,
-                                          "player_laps_completed": self._player_completed,
+                                          "player_laps_remaining_raw": self._player_remaining,
+                                          "laps_completed_before": self.lap,
                                           "session_time_s": _r(self.session_time, 2)})
+            if body.get("lap") is not None:
+                self._lapc_lap = body["lap"]
+                self._set_lap(body["lap"] - 1, now, "lapc")
+                self._update_laps_remaining()
+            self._pit_boundary("LAPC", None)
             if self._tire is not None and self._tire["open"] and self._tire["pre_race"]:
                 self._close_tire("race started (LAPC)")
             self._eval_tires(now)
+        elif code == "PITW":
+            self._pit_boundary("PITW", body.get("pit_planned"))
         elif code == "PITO":
             self._close_tire("left the pit lane (PITO)")
             if self.in_pits:
@@ -789,13 +821,95 @@ class TriggerEngine:
 
     def _set_pits(self, in_pits, pit_planned, now):
         was = self.in_pits
+        was_planned = self.pit_planned
         self.in_pits = in_pits
         self.pit_planned = pit_planned
         if in_pits and self._stint is not None:
             self._stint["pitted"] = True
+        self._verify_pit(was_planned, now)
         if was and not in_pits:
             self._close_tire("left the pit lane")
             self._pit_exit(now)
+
+    # pit call verification (observed 0.88.2: a call just before a lap boundary was dropped by the game)
+
+    def note_pit_command(self, pit, result, now=None):
+        """A set_pit result. Only an acknowledged call is verified; a cancel by the API ends the verification."""
+        if not isinstance(result, dict) or not result.get("ok"):
+            return
+        now = self.clock() if now is None else now
+        if pit:
+            self._pit_call = {"state": "pending", "called_st": self.session_time, "called_wall": now,
+                              "laps_completed_at_call": self.lap, "boundary_st": None, "boundary_by": None,
+                              "pitw_pit_planned": None, "confirmed_st": None, "lost_st": None}
+            if self.pit_planned:
+                self._pit_call.update(state="confirmed", confirmed_st=self.session_time)
+        else:
+            self._pit_call = None        # cancelled through the API: a pit_planned false is expected
+
+    def _pit_boundary(self, by, pitw_planned):
+        pc = self._pit_call
+        if pc is None or pc["state"] not in ("pending", "confirmed"):
+            return
+        if pc["boundary_st"] is None and (pc["called_st"] is None or self.session_time is None
+                                          or self.session_time >= pc["called_st"]):
+            pc["boundary_st"], pc["boundary_by"] = self.session_time, by
+        if by == "PITW" and pitw_planned is not None:
+            pc["pitw_pit_planned"] = bool(pitw_planned)
+
+    def _verify_pit(self, was_planned, now):
+        pc = self._pit_call
+        if self.pit_planned:
+            if not was_planned or self.pit_planned_by is None:
+                self.pit_planned_by = "api" if pc is not None and pc["state"] in ("pending", "confirmed") \
+                    else "game"
+        else:
+            self.pit_planned_by = None
+        if pc is None:
+            return
+        if self.in_pits:
+            self._pit_call = None        # the stop is happening: the call did its job
+            return
+        if self.pit_planned:
+            if pc["state"] == "pending":
+                pc.update(state="confirmed", confirmed_st=self.session_time)
+            elif pc["state"] == "lost":
+                self._pit_call = None    # planned again (by the game's own strategy; no API call since)
+            return
+        if pc["state"] not in ("pending", "confirmed") or pc["boundary_st"] is None or self.session_time is None:
+            return
+        if self.session_time - pc["boundary_st"] < PIT_VERIFY_ST:
+            return
+        pc.update(state="lost", lost_st=self.session_time)
+        self._pit_notes.append(
+            "pit_call_lost: set_pit(true) was acknowledged at session time %s, but after the next lap boundary (%s "
+            "at %s) pit_planned is false and the car has not entered the pit lane: the game dropped the call (seen "
+            "in 0.88.2 for a call made ~1.5 s before the line). The server does not re-send it: call set_pit(true) "
+            "again if you still want the stop (check can_pit)."
+            % (_r(pc["called_st"], 1), pc["boundary_by"], _r(pc["boundary_st"], 1)))
+        self._tires_armed = True         # wake the model again if the tires still won't last
+
+    @property
+    def pit_call_lost(self):
+        return self._pit_call is not None and self._pit_call["state"] == "lost"
+
+    def take_notes(self):
+        """Notes for the next wait_for_trigger result (each returned once)."""
+        notes, self._pit_notes = self._pit_notes, []
+        return notes
+
+    def pit_state(self):
+        pc = self._pit_call
+        out = {"pit_planned": self.pit_planned, "pit_planned_by": self.pit_planned_by,
+               "pit_call_lost": self.pit_call_lost}
+        if pc is not None:
+            out["api_call"] = {"state": pc["state"], "called_at_session_time_s": _r(pc["called_st"], 2),
+                               "laps_completed_at_call": pc["laps_completed_at_call"],
+                               "next_lap_boundary_session_time_s": _r(pc["boundary_st"], 2),
+                               "boundary_seen_by": pc["boundary_by"], "pitw_pit_planned": pc["pitw_pit_planned"],
+                               "confirmed_at_session_time_s": _r(pc["confirmed_st"], 2),
+                               "lost_at_session_time_s": _r(pc["lost_st"], 2)}
+        return out
 
     def _pit_exit(self, now):
         self._pit_no += 1
@@ -810,14 +924,35 @@ class TriggerEngine:
 
     def _update_laps_remaining(self):
         if self.total_laps and self.lap is not None:
-            self.laps_remaining = max(0, self.total_laps - self.lap)
+            done = self.total_laps if self.finished else self.lap
+            self.laps_remaining = max(0, self.total_laps - done)
         else:
             self.laps_remaining = None
 
+    @property
+    def current_lap(self):
+        """The lap being driven (laps_completed + 1), None once the race is done or before any lap count."""
+        if self.lap is None or self.finished:
+            return None
+        if self.total_laps and self.lap >= self.total_laps:
+            return None
+        return self.lap + 1
+
+    def _laps_completed(self):
+        if self.lap is None:
+            return None
+        if self.finished and self.total_laps:
+            return self.total_laps
+        return self.lap
+
     def _set_lap(self, lap, now, source):
-        """A laps-completed candidate (Lap Data or Player total - remaining); the count is monotone."""
+        """A laps-completed candidate (Lap Data lap - 1, LAPC lap - 1, Player total - remaining - 1, FINI); clamped
+        to 0..total_laps and monotone."""
         if lap is None:
             return
+        lap = max(0, lap)
+        if self.total_laps:
+            lap = min(lap, self.total_laps)
         if self.lap is None:
             self.lap = lap           # first sight (perhaps mid-lap): not a boundary
             self.lap_source = source
@@ -835,6 +970,7 @@ class TriggerEngine:
         self.lap_source = source
         self._update_laps_remaining()       # before any _eval_tires (G1)
         self._last_boundary = (lap, t)
+        self._pit_boundary("lap count", None)
         st = self._stint
         if st is not None and t is not None:
             # A health sample older than HEALTH_FRESH_ST session seconds (Player / Car Telemetry missing at the
@@ -853,10 +989,17 @@ class TriggerEngine:
             del st["boundaries"][:-MAX_SAMPLES - 1]
             st["pitted"] = False
 
+    LAP_SEMANTICS = ("observed in 0.88.2 (the game README says Lap Data lap is laps completed): Lap Data lap, LAPC "
+                     "lap and Player total_laps - laps_remaining are the lap being driven; current_lap = that, "
+                     "laps_completed = current_lap - 1, laps_remaining = total_laps - laps_completed (laps still to "
+                     "finish, the current one included: 1 on the final lap, 0 after the flag)")
+
     def laps(self, now=None):
         now = self.clock() if now is None else now
-        return {"laps_completed": self.lap, "total_laps": self.total_laps, "laps_remaining": self.laps_remaining,
-                "lap_source": self.lap_source,
+        return {"current_lap": self.current_lap, "laps_completed": self._laps_completed(),
+                "total_laps": self.total_laps, "laps_remaining": self.laps_remaining,
+                "final_lap": bool(self.total_laps and self.laps_remaining == 1 and not self.finished),
+                "lap_source": self.lap_source, "lap_semantics": self.LAP_SEMANTICS,
                 "lap_data_age_s": None if self._lapdata_wall is None else round(now - self._lapdata_wall, 2),
                 "lap_observations": list(self.lap_observations)}
 
@@ -969,8 +1112,10 @@ class TriggerEngine:
         payload.update({
             "reason": "floor_no_forecast" if floor else "prediction",
             "tire_margin": cfg.tire_margin, "tire_floor": cfg.tire_floor,
-            "laps_remaining": self.laps_remaining, "laps_completed": self.lap, "total_laps": self.total_laps,
-            "can_pit": self.can_pit, "pit_planned": self.pit_planned,
+            "laps_remaining": self.laps_remaining, "laps_completed": self._laps_completed(),
+            "current_lap": self.current_lap, "total_laps": self.total_laps,
+            "can_pit": self.can_pit, "pit_planned": self.pit_planned, "pit_planned_by": self.pit_planned_by,
+            "pit_call_lost": self.pit_call_lost,
             "compound": self.compound, "compound_picks_left": self.compound_picks_left,
             "pit_lane_time_loss_s": _r(self.pit_lane_time_loss_s, 2),
             "lap_time_s": _r(lap_s, 2), "lap_time_source": lap_src,
@@ -985,7 +1130,8 @@ class TriggerEngine:
     def _append(self, kind, now, payload):
         self.seq += 1
         trig = {"seq": self.seq, "type": kind, "session_uid": self.session_uid,
-                "session_time_s": _r(self.session_time, 2), "lap": self.lap, "frame": self.frame, "_at": now,
+                "session_time_s": _r(self.session_time, 2), "lap": self.current_lap,
+                "laps_completed": self._laps_completed(), "frame": self.frame, "_at": now,
                 "_stint": self._stint_id, "_pit": self._pit_no, "_session_no": self.sessions, "returns": 0, "returned_at": None}
         trig.update(payload)
         while len(self.triggers) >= self.maxlen:
@@ -1003,7 +1149,8 @@ class TriggerEngine:
     def _fire(self, kind, now, payload):
         payload = dict(payload)
         if kind == "car_damaged":
-            payload.update(can_pit=self.can_pit, pit_planned=self.pit_planned, in_pits=self.in_pits,
+            payload.update(can_pit=self.can_pit, pit_planned=self.pit_planned, pit_planned_by=self.pit_planned_by,
+                           pit_call_lost=self.pit_call_lost, in_pits=self.in_pits,
                            laps_remaining=self.laps_remaining)
         elif kind == "card_offer":
             payload.update(in_pits=self.in_pits)
@@ -1196,14 +1343,17 @@ class TriggerEngine:
             "performance_areas_pending": [P.PERFORMANCE_AREAS[a] for a in sorted(self._perf_pending)],
             "laps": self.laps(),
             "lap_observations": list(self.lap_observations),
-            "lapc_lap_meaning": "unknown (recorded in laps.lap_observations; not used as a lap count)",
+            "lapc_lap_meaning": "the lap now being driven (observed 0.88.2: 1 at the start, total_laps + 1 at the "
+                                "flag); laps_completed = LAPC lap - 1",
+            "pit": self.pit_state(),
             "tires": {
                 "armed": self._tires_armed, "silenced_because": self._silenced(),
                 "compound": self.compound, "stint_id": self._stint_id,
                 "stint_started_because": st["why"] if st else None,
                 "per_lap_samples": [_r(s, 4) for s in st["samples"]] if st else [],
                 "lap_time_s": _r(lap_s, 2), "lap_time_source": lap_src,
-                "laps_completed": self.lap, "laps_remaining": self.laps_remaining,
+                "laps_completed": self._laps_completed(), "current_lap": self.current_lap,
+                "laps_remaining": self.laps_remaining,
                 "in_pits": self.in_pits, "pit_planned": self.pit_planned,
                 **self.tire_prediction(),
             },

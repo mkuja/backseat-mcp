@@ -14,8 +14,13 @@ Behaviour seen in the real game (0.88.2) that the server must cope with is model
 - reorder(perm): the game re-orders car indices by race position mid-session: every per-car packet (Motion, Car
   Telemetry, Lap Data, Car Status, Car Abilities, Participants) is permuted, seat_car[0] follows my car, and
   positions are rewritten to index + 1. Participants still only comes every 5 s.
-- lapc_mode: "completed" (LAPC's lap = laps completed) or "lap_number" (= laps completed + 1); the README does
-  not say which.
+- Lap counting as observed (8-lap race at China): ``self.lap`` here is laps COMPLETED, but every packet carries
+  the lap being driven: Lap Data ``lap`` = completed + 1 (the game README says "laps completed", wrong in 0.88.2;
+  it reads total + 1 after the flag), the LAPC event's ``lap`` = completed + 1 (1 at the start, total + 1 at the
+  flag) and Player ``laps_remaining`` = laps after the current one (total - completed - 1, 0 on the final lap).
+- pit_call_drop_window_s: a set_pit(true) acknowledged less than this many seconds before a scenario lap boundary
+  is dropped at the boundary (pit_planned false afterwards), as seen once in 0.88.2. game_plans_pit() plans a stop
+  without any API call (the game's own strategy; can_pit false), also seen in 0.88.2.
 
 Manual use (then point the MCP server at the same ports, which are the game's defaults):
 
@@ -78,7 +83,8 @@ class FakeGame:
         self.paused_at = None            # monotonic time the game paused (session_time frozen)
         self.paused_total = 0.0
         self.auto_pause_on_hand = False
-        self.lapc_mode = "completed"     # LAPC's lap: "completed" laps or the new "lap_number" (completed + 1)
+        self.pit_call_drop_window_s = 0.0   # see the module docstring
+        self._last_pit_call = None       # monotonic time of the last accepted set_pit(true)
         self.templates = {}
         for name in TELEMETRY + ["event"]:
             with open(os.path.join(DATA, name + ".bin"), "rb") as f:
@@ -106,7 +112,7 @@ class FakeGame:
 
         # scenario overrides for the player's car; None keeps the captured value
         self.total_laps = None
-        self.lap = None                  # laps completed
+        self.lap = None                  # laps COMPLETED (packets carry the lap being driven, completed + 1)
         self.tire_health = None
         self.puncture = None
         self.compound = None             # compound index
@@ -222,14 +228,16 @@ class FakeGame:
             data[PLAYER_PIT_FLAGS] = ((1 if self.pit_planned else 0) | (2 if self.can_pit else 0)
                                       | (4 if self.in_pits else 0))
             if self.total_laps is not None and self.lap is not None:
-                struct.pack_into("<HH", data, PLAYER_TOTAL_LAPS, self.total_laps, max(0, self.total_laps - self.lap))
+                # observed 0.88.2: laps_remaining = laps after the current one
+                struct.pack_into("<HH", data, PLAYER_TOTAL_LAPS, self.total_laps,
+                                 max(0, self.total_laps - self.lap - 1))
             self._patch_tires(data, PLAYER_COMPOUND)
         elif name == "car_telemetry":
             self._patch_tires(data, HEADER.size + self.my_car * TELEMETRY_CAR + 48)
         elif name == "lap_data":
             offset = HEADER.size + self.my_car * LAP_CAR
             if self.lap is not None:
-                struct.pack_into("<H", data, offset + 2, self.lap)
+                struct.pack_into("<H", data, offset + 2, self.lap + 1)     # the lap being driven (observed 0.88.2)
             flags = data[offset + 4] & ~(1 | 4)
             data[offset + 4] = flags | (1 if self.in_pits else 0) | (4 if self.pit_planned else 0)
         elif name == "car_status":
@@ -281,9 +289,13 @@ class FakeGame:
             if lap != self.lap:
                 self.lap = lap
                 fire = lap
+                call = self._last_pit_call
+                if (self.pit_planned and call is not None and self.pit_call_drop_window_s > 0
+                        and time.monotonic() - call < self.pit_call_drop_window_s):
+                    self.pit_planned = False         # the game drops a call made just before the line
         if fire is not None:
-            self.lap_event(fire if self.lapc_mode == "completed" else fire + 1, self.my_car + 1)
-            self.pit_window_event(fire)
+            self.lap_event(fire + 1, self.my_car + 1)            # LAPC: the lap now being driven
+            self.pit_window_event(fire + 1)
 
     def pit_stop(self, compound=None, health=1.0):
         """Enter and leave the pit lane at once with fresh tires (PITI, PITO events)."""
@@ -301,6 +313,11 @@ class FakeGame:
             self.puncture = False if self.puncture else self.puncture
         self.in_pits = False
         self.send_event("PITO", 0)
+
+    def game_plans_pit(self):
+        """The game's own strategy plans a stop (no API call); can_pit goes false."""
+        with self.lock:
+            self.pit_planned, self.can_pit = True, False
 
     def boosting(self):
         now = time.monotonic()
@@ -487,6 +504,7 @@ class FakeGame:
         if payload[1] and not self.can_pit:
             return E_REFUSED
         self.pit_planned = bool(payload[1])
+        self._last_pit_call = time.monotonic() if payload[1] else None
 
     def _cmd_4(self, payload):                       # pick_tire
         if payload[1] > 6:

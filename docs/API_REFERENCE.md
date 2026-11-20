@@ -223,9 +223,9 @@ Per car, 58 bytes (`<3f` + 4 x `Bff` + `BBff`).
 | `steer` | float | -1 left to 1 right | as applied |
 | `wheels[4]` | Wheel x4 | | two front wheels, then two rear. Left/right order within a pair is not stated. |
 | `tire_compound` | uint8 | Compounds enum | |
-| `tire_flags` | uint8 | bit 0: puncture | |
+| `tire_flags` | uint8 | bit 0: puncture | **[observed 0.88.2]** set when `tire_health` reaches 0.0 (worn-out tires puncture) |
 | `tire_health` | float | 1 new to 0 worn out | |
-| `energy` | float | 0 to 1 | boost or fuel left; `Session.fuel` says which |
+| `energy` | float | 0 to 1 | boost or fuel left; `Session.fuel` says which. **[observed 0.88.2]** 0..1 at the base capacity; can exceed 1 with capacity upgrades (BoostCapacity cards; seen up to 3.69) |
 
 Wheel (9 bytes):
 
@@ -243,7 +243,7 @@ Per car, 18 bytes (`<BBHBBfff`).
 |---|---|---|---|
 | `position` | uint8 | from 1 | overall race position |
 | `class_position` | uint8 | from 1 | position within the car's class |
-| `lap` | uint16 | | laps completed |
+| `lap` | uint16 | | [README] laps completed. **[observed 0.88.2]** the lap being driven (1 on the first lap, `total_laps + 1` after the flag; lags `LAPC` by one sample) |
 | `flags` | uint8 | bits | bit 0 `in_pits`: in the pit lane; bit 1 `finished`; bit 2 `pit_planned`: pit stop called, **this machine's cars only** (a rival's call is never shown); bit 3 `api_driving`: an API client is driving it |
 | `pit_stops` | uint8 | | stops made |
 | `gap_to_leader` | float | seconds | |
@@ -272,14 +272,14 @@ One per local player; 1,015 bytes after the header
 | `hand` | Hand (17 bytes) | | the cards on offer |
 | `upgrades_applied` | uint16 | | count of upgrades applied so far |
 | `total_laps` | uint16 | | |
-| `laps_remaining` | uint16 | | |
+| `laps_remaining` | uint16 | | **[observed 0.88.2]** laps after the current one (0 on the final lap): `total_laps - laps_remaining` = the lap being driven |
 | `pit_flags` | uint8 | bits | bit 0 `pit_planned`: stop called; bit 1 `can_pit`: a stop can be called now; bit 2 `in_pits` |
 | `pit_stops` | uint8 | | stops made |
 | `tire_compound` | uint8 | Compounds enum | |
-| `tire_flags` | uint8 | bit 0: puncture | |
+| `tire_flags` | uint8 | bit 0: puncture | **[observed 0.88.2]** set when `tire_health` reaches 0.0 |
 | `tire_health` | float | 1 new to 0 worn out | |
 | `compound_picks_left[7]` | uint8 x7 | per compound, 255 = no limit | how many more times each compound can be picked. bc_api turns 255 into `None`. |
-| `energy` | float | 0 to 1 | boost or fuel |
+| `energy` | float | 0 to 1 | boost or fuel. **[observed 0.88.2]** can exceed 1 with capacity upgrades (seen up to 3.69) |
 | `has_strategy` | bool | | 0 when this seat has no strategy model; all fields below are then zero. bc_api returns `strategy: None`. |
 | `start_grid_position` | uint8 | | |
 | `laps_since_pit` | uint16 | | |
@@ -434,7 +434,7 @@ The README does not prescribe a response to any event. The "answer with" column 
 | `SEND` | the session ends | 255 [inferred] | none | nothing |
 | `CARD` | a local player has points and a new hand | the player's seat | `[0] uint8 points`, `[1..17] Hand hand` (count + 4 x Card) | `pick_card(index)` to spend a point, optionally `ban_card(index)` first (a ban keeps the turn) |
 | `TIRE` | the tire screen opens: starting grid, qualifying box or pit stop | the player's seat | `[0] bool pre_race` (a race that has not started), `[1] uint8 current` compound, `[2] uint8 allowed` (bit per compound index), `[3..9] uint8 picks_left[7]` (255 = no limit) | `pick_tire(compound)` with a compound whose bit is set in `allowed` |
-| `LAPC` | each new lap | the player's seat | `[0..1] uint16 lap`, `[2] uint8 position` | nothing (informational) |
+| `LAPC` | each new lap | the player's seat | `[0..1] uint16 lap`, `[2] uint8 position` | nothing (informational). **[observed 0.88.2]** `lap` = the lap now being driven: 1 at the start, `total_laps + 1` at the flag |
 | `PITW` | each new lap | the player's seat | `[0..1] uint16 lap`, `[2] bool pit_planned`, `[3] bool can_pit` | `set_pit(true/false)` if the plan should change and `can_pit` is set |
 | `PITI` | entering the pit lane | the player's seat | none | nothing; a `TIRE` event is expected to follow when the tire screen opens |
 | `PITO` | leaving the pit lane | the player's seat | none | nothing |
@@ -585,7 +585,9 @@ inferred unless marked [README], [capture] or [observed 0.88.2]; the README has 
   - `invalid_index` (10): index outside the hand. [capture: `pick_card` with a bad index returned this; `validate`
     sends index 99 and expects an Error.]
   - `cards_unavailable` (11): no hand on offer right now [inferred]. **[observed 0.88.2]** also returned for a hand
-    offered while the car was in the pit lane; the same pick succeeded seconds later.
+    that arrived while the car was in the pit box (after `pick_tire`). The game stayed paused, so no `PITO` came and
+    waiting for the pit exit deadlocked; the same pick retried ~30 s later succeeded. The game stays paused until a
+    card is picked: retry `pick_card` after a few seconds, do not wait for the pit exit.
   - `card_banned` (12): [README] "a banned card ... comes back as an error".
   - `driver_decided` (13): reserved, never sent.
 - Side effects: spends one upgrade point and applies the card's upgrade. A pick ends the turn for that hand
@@ -600,6 +602,10 @@ inferred unless marked [README], [capture] or [observed 0.88.2]; the README has 
 - Side effects: sets or clears the pit call; visible afterwards as `pit_planned` in Player, Lap Data (bit 2) and
   the next `PITW`. The car then enters the pits (`PITI`), the tire screen opens (`TIRE`), and it leaves (`PITO`).
   Exactly when a called stop is taken (this lap or next) is not stated.
+- **[observed 0.88.2]** An Ack is not a confirmation: a call acknowledged ~1.5 s before a lap boundary
+  (`LAPC` / `PITW`) was dropped at the boundary (`pit_planned` false afterwards); a second call after the boundary
+  stuck. Separately, `pit_planned` became true with `can_pit` false without any API call: the game's own strategy
+  planned the stop. This server verifies each call (`pit_call_lost`, `pit_planned_by`) and never re-sends it.
 
 #### 4 `pick_tire`
 
@@ -1289,4 +1295,6 @@ server, so always current). The design notes that shaped them:
     re-ordered by race position (section 2.0).
 19. **Pause during a card hand** [observed 0.88.2]. The game pauses while a hand waits: only Session, Car Status and
     Participants keep arriving and `session_time` stops. Not mentioned in the README.
-20. **`LAPC.lap`**: whether it is the lap just completed or the new lap number is not stated.
+20. **`LAPC.lap` and Lap Data `lap`** [observed 0.88.2]: both are the lap being driven (an 8-lap race: `LAPC` 1 at
+    the start, 9 at the flag; Lap Data `lap` 9 after the flag), and Player `laps_remaining` counts the laps after the
+    current one. The README says Lap Data `lap` is "laps completed", which is wrong in 0.88.2.

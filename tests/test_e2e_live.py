@@ -393,14 +393,15 @@ def test_l2_index_shuffle_no_wrong_names(tmp_path):
     run(main(), 60)
 
 
-# ------------------------------------------------------------------------------------- 6. G1 last lap, both lapc modes
+# ------------------------------------------------------------------------------------- 6. G1 last lap (0.88.2 lap semantics)
 
-async def race(tmp_path, lapc_mode, total_laps, name):
+async def race(tmp_path, total_laps, name):
+    """The fake game sends the lap semantics observed in 0.88.2 (Lap Data lap / LAPC = the lap being driven, Player
+    laps_remaining = laps after the current one); game.lap is the truth in laps completed."""
     lap_s = 2.0
     found = []
     with fake_game() as (game, port):
         game.points, game.hand = 0, []
-        game.lapc_mode = lapc_mode
         # from the session's first packet on (the captured Lap Data says lap 2; laps never go back in a session)
         game.start_scenario(lap_s=lap_s, wear_per_lap=0.4, start_health=1.0, total_laps=total_laps, lap=0)
         t_end = time.monotonic() + lap_s * total_laps + 0.8
@@ -414,32 +415,28 @@ async def race(tmp_path, lapc_mode, total_laps, name):
                     found.append((t, game.lap))
                 snap = await srv.call("get_race_snapshot")
                 lc, lr = snap.get("laps_completed"), snap.get("laps_remaining")
-                truth = game.lap
+                truth = min(game.lap, total_laps)
                 if lc is not None:
-                    assert lc in (truth, truth - 1), (lapc_mode, lc, truth, snap.get("lap_source"))
-                    assert lr == total_laps - lc, (lapc_mode, lc, lr, snap.get("lap_source"))
+                    # never ahead of the truth (the 0.2.0 bug: one too high); may lag a sample at a boundary
+                    assert lc in (truth, truth - 1), (lc, truth, snap.get("lap_source"))
+                    assert lr == total_laps - lc, (lc, lr, snap.get("lap_source"))
+                    if lc < total_laps:
+                        assert snap.get("current_lap") == lc + 1, snap
             cfg = await srv.call("get_trigger_config")
             obs = (cfg.get("laps") or {}).get("lap_observations") or cfg["state"].get("lap_observations")
     return found, obs
 
 
-def test_g1_last_lap_silent_lapc_completed(tmp_path):
-    found, obs = run(race(tmp_path, "completed", 3, "completed"))
+def test_g1_last_lap_silent(tmp_path):
+    found, obs = run(race(tmp_path, 3, "observed"))
     assert all(t.get("laps_remaining") is None or t["laps_remaining"] > 1 for t, _ in found), found
-    assert all(lap < 2 for _, lap in found), found          # never once the last lap has started
-    assert obs, "get_trigger_config has no lap_observations (X9)"
-
-
-def test_g1_last_lap_silent_lapc_lap_number(tmp_path):
-    found, obs = run(race(tmp_path, "lap_number", 3, "lap_number"))
-    assert all(t.get("laps_remaining") is None or t["laps_remaining"] > 1 for t, _ in found), found
-    assert all(lap < 2 for _, lap in found), found
+    assert all(lap < 2 for _, lap in found), found          # never once the final lap has started
     assert obs and any(o.get("lapc_lap") is not None for o in obs), obs
 
 
 def test_g1_positive_control_fires_before_last_lap(tmp_path):
     """Same wear in a 4-lap race: the forecast fires going into lap 3 of 4 (so the 3-lap silence is real)."""
-    found, obs = run(race(tmp_path, "lap_number", 4, "control"))
+    found, obs = run(race(tmp_path, 4, "control"))
     assert found, "tires_wont_last never fired with 0.4 wear per lap"
     assert all(t.get("laps_remaining", 2) >= 2 for t, _ in found), found
 

@@ -10,6 +10,12 @@ from . import protocol as P
 
 SETTINGS_PATH = "Settings > Telemetry"
 
+# What to do on pick_card -> cards_unavailable (observed 0.88.2: a hand arrived while the car was in the pit box after
+# pick_tire; the game paused; waiting for PITO deadlocked because the paused game never leaves the pit; the same pick
+# ~30 s later succeeded).
+CARDS_UNAVAILABLE_HINT = ("The game stays paused until a card is picked; retry pick_card after a few seconds - do not "
+                          "wait for the pit exit (a paused game never leaves the pit box). The hand stays open.")
+
 # Broadcast switches: Hello.broadcast_flags bit, the key used in tool output, and the packets each one gates.
 BROADCAST_SWITCHES = {
     "driver_data": {
@@ -81,9 +87,11 @@ PACKET_INFO = {
                    "Per car: world position (m), velocity and angular velocity in the car's own frame, pitch/roll/yaw."),
     P.PKT_CAR_TELEMETRY: ("at the configured rate", "Driver Data",
                           "Per car: speed, applied pedal and steer, four wheels (track limits, ground contact, slip), "
-                          "tire compound, puncture, tire health, energy (boost or fuel)."),
+                          "tire compound, puncture, tire health, energy (boost or fuel; 0..1 at the base capacity, "
+                          "can exceed 1 with capacity upgrades, observed up to ~3.7)."),
     P.PKT_LAP_DATA: ("at the configured rate", "Driver Data",
-                     "Per car: position, class position, laps completed, pit/finished flags, pit stops, gaps."),
+                     "Per car: position, class position, lap (the README says laps completed; observed in 0.88.2 it "
+                     "is the lap being driven), pit/finished flags, pit stops, gaps."),
     P.PKT_CAR_STATUS: ("twice a second", "Driver Data",
                        "Per car: current performance ratio in each of the 8 performance areas."),
     P.PKT_PLAYER: ("at the configured rate, one per local player", "Player Data",
@@ -141,9 +149,12 @@ EVENT_INFO = {
              "details": ["pre_race (a race that has not started)", "current compound", "allowed compounds",
                          "picks_left per compound (null = no limit)"],
              "respond": "pick_tire(compound) with one of the allowed compounds."},
-    "LAPC": {"when": "each new lap", "details": ["lap", "position"], "respond": None},
+    "LAPC": {"when": "each new lap", "details": ["lap (observed 0.88.2: the lap now being driven; 1 at the start, "
+                                                 "total_laps + 1 at the flag)", "position"], "respond": None},
     "PITW": {"when": "each new lap", "details": ["lap", "pit_planned", "can_pit"],
-             "respond": "set_pit(true) to call a stop or set_pit(false) to cancel one, when can_pit is true."},
+             "respond": "set_pit(true) to call a stop or set_pit(false) to cancel one, when can_pit is true. "
+                        "Observed in 0.88.2: a call acknowledged ~1.5 s before this boundary was dropped at it; "
+                        "check pit_planned after it."},
     "PITI": {"when": "entering the pit lane", "details": [], "respond": None},
     "PITO": {"when": "leaving the pit lane", "details": [], "respond": None},
     "FINI": {"when": "the player takes the flag", "details": ["position"], "respond": None},
@@ -200,8 +211,8 @@ ERROR_INFO = {
         "The game refused the command with reason cards_unavailable (the README gives only the name; presumably no "
         "hand can be picked from right now - inferred).",
         "The API documentation gives only the name of this reason. Observed in game 0.88.2 for a hand offered "
-        "while the car was in the pit lane; the same pick succeeded seconds later. The hand stays open: pick_tire "
-        "first if the tire screen is open, or retry after the car leaves the pit lane (PITO). Otherwise check "
+        "while the car was in the pit box (after pick_tire); the game paused, waiting for the pit exit deadlocked, "
+        "and the same pick ~30 s later succeeded. " + CARDS_UNAVAILABLE_HINT + " Otherwise check "
         "get_pending_decisions for a hand on offer."),
     "card_banned": (
         "That card is banned and cannot be picked (inferred from the name; the README gives only the name).",
@@ -319,7 +330,7 @@ OUTCOME_UNKNOWN_HINT = (
 
 # Behaviour seen against the live game that the README does not state (or contradicts). Observations, not spec.
 OBSERVED = {
-    "game_version": "0.88.2 (one race, Turkey, 10 laps)",
+    "game_version": "0.88.2 (races at Turkey, 10 laps, and China, 8 laps)",
     "pause_during_hand": "The game pauses while a card hand waits for the player: only Session and Car Status "
                          "(twice a second) and Participants keep arriving, the configured-rate packets stop and "
                          "session_time does not advance. Answer card_offer at once.",
@@ -328,7 +339,25 @@ OBSERVED = {
                            "index was always position - 1. player_id stays the same; this server resolves 'me' from "
                            "each packet's own seat_car[0] and offers car='ahead' / 'behind'.",
     "cards_unavailable_in_pits": "pick_card was refused with cards_unavailable for a hand offered while the car was "
-                                 "in the pit lane; the same pick succeeded seconds later.",
+                                 "in the pit lane, stopped in the pit box after pick_tire. The game stayed paused (no PITO), so waiting for "
+                                 "the pit exit deadlocked; the same pick retried ~30 s later succeeded. "
+                                 + CARDS_UNAVAILABLE_HINT,
+    "lap_counting": "Lap Data lap (my car), the LAPC event's lap and Player total_laps - laps_remaining are all the "
+                    "lap being driven (8-lap race: LAPC 1 at the start, LAPC 9 at the flag; Lap Data lags LAPC by "
+                    "one sample and reads 9 after the flag). Player laps_remaining counts the laps after the current "
+                    "one (0 on the final lap). The game README says Lap Data lap is laps completed, which is wrong in "
+                    "0.88.2. This server: laps_completed = current lap - 1, laps_remaining = total_laps - "
+                    "laps_completed (the current lap included).",
+    "pit_call_lost": "set_pit(true) acknowledged ~1.5 s before a lap boundary (LAPC / PITW) was dropped: pit_planned "
+                     "was false afterwards. A second call after the boundary stuck. The server verifies each call "
+                     "and reports pit_call_lost; it never re-sends.",
+    "pit_planned_by_game": "pit_planned became true (can_pit false) without any API call: the game's own strategy "
+                           "planned the stop. Reported as pit_planned_by: \"game\".",
+    "energy_above_one": "energy (boost) went up to 3.69: BoostCapacity cards raise the cap, so energy is 0..1 only at "
+                        "the base capacity. Not clamped.",
+    "worn_tire_punctures": "tire_health reaching 0.0 set the puncture flag (worn-out tires puncture).",
+    "stale_tool_schema": "An MCP client with a tool schema cached from an older server version sent pick_card "
+                         "seq=\"1\" (a string); pick_card / ban_card now accept numeric strings for index and seq.",
     "client_call_limit": "The Claude desktop app's remote-device bridge cut a tool call at about 80 s regardless of "
                          "progress notifications, and the call's result was lost: waits are capped at 55 s.",
 }
@@ -398,13 +427,17 @@ def _topic_triggers():
              "needs": "Decision Events or Player Data", "heuristic": False},
             {"type": "car_damaged", "fires_on": "puncture flag set in two consecutive sampled packets of the same source (Player, or "
                                                 "Car Telemetry without Player Data; definite; re-arms after 3 s of "
-                                                "session time clear or a pit exit); or a sudden drop of one performance "
+                                                "session time clear or a pit exit; observed in 0.88.2: worn-out "
+                                                "tires, health 0.0, puncture); or a sudden drop of one performance "
                                                 "area of your car not shared by the field and not during an ability "
                                                 "(heuristic, BC_TRIGGER_PERF_DROP / BC_TRIGGER_PERF_WINDOW_S)",
              "needs": "Player Data or Driver Data (puncture); Driver Data (performance)", "heuristic": "partly"},
             {"type": "tires_wont_last", "fires_on": "predicted tire health at the end of the next lap <= "
-                                                    "BC_TIRE_MARGIN, or health <= BC_TIRE_FLOOR; silent on the last "
-                                                    "lap, in the pit lane, after the flag, or with a stop called",
+                                                    "BC_TIRE_MARGIN, or health <= BC_TIRE_FLOOR; silent on the final "
+                                                    "lap (laps_remaining 1), in the pit lane, after the flag, or with "
+                                                    "a stop called; re-armed when an acknowledged set_pit(true) is "
+                                                    "found lost (pit_call_lost). Observed in 0.88.2: a tire worn to "
+                                                    "health 0.0 punctures",
              "needs": "Player Data or Driver Data; Driver Data (Lap Data) or Decision Events (LAPC) to count laps",
              "heuristic": True},
             {"type": "tire_screen", "fires_on": "TIRE event for seat 0 (on by default; BC_TRIGGERS)",

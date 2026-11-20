@@ -137,6 +137,8 @@ Claude to "be my race engineer", or invoke the `race_engineer` prompt.
 | `game.reachable: false` | Game not running, Game API off, or a different `BC_COMMAND_HOST` / `BC_COMMAND_PORT`. |
 | `receiving: false`, `not_in_session` | The game sends no telemetry outside a session (practice, qualifying, race). Start one in the game. |
 | `paused: true`, data "frozen" | The game stops time while a card hand waits: only Session, Car Status and Participants keep coming. Answer the hand (`pick_card`). |
+| `pick_card` refused with `cards_unavailable` | Seen in 0.88.2 for a hand that arrived while the car was in the pit box: the game stays paused until a card is picked; retry `pick_card` after a few seconds - do not wait for the pit exit (a paused game never leaves the pit box). |
+| `pit_call_lost: true` | The game dropped an acknowledged `set_pit(true)` at the next lap boundary (seen in 0.88.2 for a call ~1.5 s before the line). Call `set_pit(true)` again if the stop is still wanted; the server never re-sends it. |
 | A tool call fails after about 80 s with a client error | Some clients cut tool calls at about 80 s whatever the progress notifications (seen with the Claude desktop app's remote-device bridge). `wait_for_trigger` waits at most 55 s by default and never more than 60 s, which avoids this. If a result is lost anyway, pass `since_seq`: an open decision comes back about 20 s after it was last returned (at most 3 times), another trigger once. |
 | Old behaviour after an update | Installed tool: `uv tool install --reinstall .`; uvx: `uv cache clean backseat-champions-mcp && uv cache prune`. Then fully restart the client and check `server_version` (see **Updating**). |
 | `boost` / `drive` returns `no_reply` | Usually the game is not answering. Under an extreme flood of replies, though, their liveness ping can time out while the hold has started: check `get_car_abilities` (`api_boosting`) / `get_api_status` (holds), or call `stop_boost` / `release_drive`. |
@@ -152,8 +154,8 @@ No setup is needed. The server ships its own operating guide in three places:
 
 In short: call `get_api_status` first; then loop on `wait_for_trigger(timeout_s=55, since_seq=last)`; answer a
 `card_offer` first and at once with `pick_card(index, seq)` (the game pauses while a hand waits); answer
-`tire_screen` with `pick_tire`; on `tires_wont_last` / `car_damaged` decide `set_pit`; set `last` to the result's
-`last_seq` after acting. Use `car="me"`, `"ahead"` or `"behind"` instead of car indices, which change with positions.
+`tire_screen` with `pick_tire`; on `tires_wont_last` / `car_damaged` decide `set_pit` (an Ack is not a confirmation:
+watch for `pit_call_lost`); set `last` to the result's `last_seq` after acting. Use `car="me"`, `"ahead"` or `"behind"` instead of car indices, which change with positions.
 
 ### Other MCP clients
 
@@ -216,12 +218,16 @@ All thresholds are **this server's tunable heuristics, not values from the game*
   when no `CARD` event announced a hand within 2 s, the Player packet: points > 0 and a hand whose cards differ from
   the last one, stable for 0.25 s. One hand is one trigger whichever source sees it first; a `CARD` event repeating
   the same cards and points (after a ban, say) is ignored. A hand counts as answered on a successful `pick_card`
-  (or `no_points`), not on `cards_unavailable`. `pick_card(index, seq)` is refused with `hand_changed` if the hand on
-  offer is no longer that trigger's hand.
+  (or `no_points`), not on `cards_unavailable` (seen in 0.88.2 for a hand that arrived in the pit box: the game stays
+  paused until a card is picked, so retry `pick_card` after a few seconds - do not wait for the pit exit).
+  `pick_card(index, seq)` is refused with `hand_changed` if the hand on offer is no longer that trigger's hand.
+  `index` and `seq` also accept numeric strings (`"1"`): a client with a stale cached tool schema sent them in a real
+  race.
 - **tire_screen** (not heuristic). Every `TIRE` event for seat 0 (`pre_race`, `current`, `allowed`, `picks_left`).
 - **car_damaged**, `signal: "puncture"` (definite): your car's puncture flag (Player, or Car Telemetry without Player
   Data) set in two consecutive samples. Re-arms after the flag has been clear for 3 s of session time, or on pit
-  exit. Payload includes `can_pit`, `pit_planned`, `in_pits`, `laps_remaining`.
+  exit. Payload includes `can_pit`, `pit_planned`, `pit_planned_by`, `pit_call_lost`, `in_pits`, `laps_remaining`.
+  Observed in 0.88.2: worn-out tires puncture (tire health reaching 0.0 set the flag).
 - **car_damaged**, `signal: "performance_drop"` (`heuristic: true`). The README says Car Status performance is
   "moved by weather, slipstream, abilities and failures" but has no failure flag. One trigger per Car Status packet
   lists every area of your car that dropped by at least `BC_TRIGGER_PERF_DROP` (15 %) within
@@ -235,11 +241,29 @@ All thresholds are **this server's tunable heuristics, not values from the game*
   accelerate). `predicted = health - wear_per_lap * (rest of this lap + 1 lap)`. It fires when
   `predicted <= BC_TIRE_MARGIN` (0.05). `BC_TIRE_FLOOR` (0.10) applies **only when there is no forecast yet**
   (`reason: "floor_no_forecast"`): with a forecast, a low but sufficient health does not fire. Silent after the
-  flag, on the last lap (laps remaining <= 1 in a race with a lap count), in the pit lane, or with a stop already
-  called. Re-arms after new tires or when the forecast recovers.
-- **Laps.** Laps completed come from Lap Data (`lap`, laps completed per the README) and Player
-  (`total_laps - laps_remaining`); the `LAPC` event only marks a lap boundary (whether its `lap` is the completed or
-  the new lap is not documented; `get_trigger_config` shows the last ones in `lap_observations` so a live run settles it).
+  flag, on the final lap (`laps_remaining` 1 in a race with a lap count), in the pit lane, or with a stop already
+  called. Re-arms after new tires, when the forecast recovers, or when an acknowledged `set_pit(true)` turns out
+  lost. Worn-out tires (health 0.0) puncture (observed in 0.88.2).
+- **Laps** (observed in 0.88.2, 8-lap race; the game README says Lap Data `lap` is "laps completed", which is wrong
+  there). Lap Data `lap`, the `LAPC` event's `lap` (1 at the start, 9 at the flag of an 8-lap race) and Player
+  `total_laps - laps_remaining` are all the **lap being driven**; Player `laps_remaining` counts the laps after the
+  current one (0 on the final lap). The server reports `current_lap`, `laps_completed` (= current lap - 1, from the
+  highest of the three sources, clamped to 0..`total_laps`; FINI completes the race) and `laps_remaining` = laps
+  still to finish, the current one included (1 on the final lap, which also sets `final_lap`; 0 after the flag).
+  `get_player_state` shows the packet's own field as `laps_after_current`. `get_trigger_config` keeps the last
+  `lap_observations`. (0.2.0 read Lap Data as laps completed: one lap too many completed, the last-lap silence
+  started a lap early, and the end of a race showed 9/8.)
+- **Pit call verification** (observed in 0.88.2: a `set_pit(true)` acknowledged ~1.5 s before a lap boundary was
+  dropped by the game at the boundary; a second call after it stuck). An Ack only means the game received the
+  command: `set_pit(true)` waits up to 0.5 s for a sample showing `pit_planned` and says `confirmed` true or
+  false. The server keeps watching: if `pit_planned` is false 1 s (session time) after the next lap boundary (lap
+  count, `LAPC` or `PITW`), the car has not entered the pit lane and you did not cancel, the call is **lost**:
+  `pit_call_lost: true` in `get_pending_decisions`, `get_race_snapshot`, the trigger contexts and payloads, a
+  note in the next `wait_for_trigger` result, and `tires_wont_last` is re-armed so you are woken again. The server
+  never re-sends the call. `pit_planned_by` is `"api"` when `pit_planned` rose while your call was pending and
+  `"game"` otherwise: the game's own strategy can plan a stop by itself (seen with `can_pit` false).
+- **Energy** is 0..1 at the base capacity and can exceed 1 with capacity upgrades (BoostCapacity cards; observed up to
+  ~3.7). It is not clamped.
 
 ### Pauses and car indices
 
@@ -295,9 +319,9 @@ Every setting is an environment variable; most also have a CLI flag that overrid
 | `wait_for_trigger` | block until a decision is needed (the main loop) |
 | `get_api_status` | hello + ping: game version, switches (required / optional), listener health, pause, config |
 | `get_race_snapshot` | compact overview of the race for your car |
-| `get_pending_decisions` | open card hand, pit call state, open tire screen |
+| `get_pending_decisions` | open card hand, pit call state (`pit_planned_by`, `pit_call_lost`), open tire screen |
 | `pick_card` / `ban_card` | pick or ban a card from the hand (optional `seq` guard) |
-| `set_pit` | call or cancel a pit stop |
+| `set_pit` | call or cancel a pit stop (`confirmed` says whether `pit_planned` showed; lost calls are reported) |
 | `pick_tire` | pick a compound while the tire screen is open |
 | `boost` / `stop_boost` | hold boost buttons for `duration_s` 0.05 to 30 s (re-sent at 50 Hz) / release them |
 | `set_camera` | change your camera view |
@@ -386,15 +410,18 @@ folder (the one with `bc_api.py`); without it those tests are skipped.
 
 ## Known limitations and live-only questions
 
-Tested against captured packets and a fake game; one race was run against game 0.88.2, which is where the pause,
-index re-ordering, `cards_unavailable` in the pit lane and the ~80 s client limit were seen. Still open:
+Tested against captured packets and a fake game; two races were run against game 0.88.2, which is where the pause,
+index re-ordering, `cards_unavailable` in the pit box, the ~80 s client limit, the lap numbering, the lost pit call,
+energy above 1 and worn-out tires puncturing were seen. Still open:
 
 1. Whether the game pauses on every pending hand (assumed; the Player packet decides otherwise, nothing is lost).
 2. Whether events or `frame` advance during a pause (pause detection uses `session_time`).
-3. What `LAPC.lap` means (completed or new lap): not used for counting; see `get_trigger_config`.
+3. Whether a pit call is dropped only close to the lap boundary (seen once, ~1.5 s before it); `pit_call_lost` is
+   judged 1 s after the boundary and can be wrong if the game re-plans the stop later.
 4. Whether Participants is re-sent when the order changes (names of other cars are attached only when exact).
 5. Whether index = position - 1 always holds within one packet (assumed for `"ahead"` / `"behind"`).
-6. Whether `cards_unavailable` only happens in the pit lane (the hand stays open either way).
+6. Whether `cards_unavailable` only happens in the pit box (the hand stays open either way; retry after a few
+   seconds).
 7. `packet_version` values other than the README's are dropped and counted in `get_api_status`.
 8. Whether `CARD` repeats after a ban (deduplicated by cards and points).
 9. How the pre-race tire screen closes (resends are bounded either way).

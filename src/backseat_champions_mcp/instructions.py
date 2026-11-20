@@ -15,11 +15,12 @@ gameplay command on its own: nothing changes unless you call pick_card, ban_card
 2. Loop: last = 0; repeat r = wait_for_trigger(timeout_s=55, since_seq=last). Never wait longer than 55 s.
 3. Handle r.triggers, card_offer FIRST - the race is paused until you answer it:
    - card_offer: pick_card(index, seq) within seconds (ban_card first only if clearly worth it). If refused with
-     cards_unavailable while in_pits: answer the tire screen first, then pick again.
+     cards_unavailable: the game stays paused until a card is picked; retry pick_card after a few seconds.
    - tire_screen: pick_tire with a compound from allowed that has picks left.
    - tires_wont_last, or car_damaged with signal puncture: if can_pit and the race is not nearly over,
-     set_pit(true); the tire screen then arrives as a tire_screen trigger. car_damaged with signal
-     performance_drop is a heuristic: check get_car_status(car="me") first; pit only on a clear failure.
+     set_pit(true); a tire_screen trigger follows (pit_call_lost later = the game dropped it: call again).
+     car_damaged with signal performance_drop is a heuristic: check get_car_status(car="me") first; pit only on a
+     clear failure.
    - session_ended: summarise the result; wait again only if the user wants the next session.
    Entries marked resent: true are decisions still open - answer them now. r.open_decisions lists open ones.
 4. After acting, set last = r.last_seq (also after status "timeout"). If you lose track, omit since_seq.
@@ -59,15 +60,20 @@ repeat:
     pick_card(index, seq) within seconds, with seq = the trigger's seq; the server refuses with hand_changed if
     the hand on screen is no longer that one and returns the current hand: pick from that. ban_card(index, seq)
     first only when a card is clearly bad for you and you have ban tokens (a ban keeps your turn; a pick is still
-    due). With more points left a new card_offer follows. If pick_card is refused with cards_unavailable while
-    in_pits is true or a tire screen is open: answer the tire screen with pick_tire first, then pick again - the
+    due). With more points left a new card_offer follows. If a tire screen is open too, pick_tire first. If
+    pick_card is refused with cards_unavailable (seen in the pit box): the game stays paused until a card is
+    picked; retry pick_card after a few seconds - do not wait for the pit exit (it never comes while paused). The
     hand stays open.
   - tire_screen: choose a compound from allowed that has picks_left (null = no limit) and call pick_tire.
     pre_race true means the starting grid.
   - tires_wont_last: the tire forecast says health will not last to the end of the next lap. If can_pit is true
     and the race is not nearly over, set_pit(true); after the stop the tire screen arrives as a tire_screen
-    trigger. Leave it if laps_remaining is tiny.
-  - car_damaged: signal puncture is definite: if can_pit and the race is not nearly over, set_pit(true).
+    trigger. Leave it if laps_remaining (laps still to finish, the current one included) is tiny. set_pit's Ack
+    is not a confirmation: a call just before a lap boundary was seen dropped by the game. If a later result
+    shows pit_call_lost: true (context, get_pending_decisions, or a note), call set_pit(true) again if you still
+    want the stop. pit_planned_by: "game" means the game's own strategy planned a stop.
+  - car_damaged: signal puncture is definite (worn-out tires at health 0.0 puncture too): if can_pit and the race
+    is not nearly over, set_pit(true).
     signal performance_drop is a heuristic (heuristic: true): check get_car_status(car="me") first and pit only
     on a clear failure.
   - session_ended: summarise the result (position, what you decided and why) and stop, unless the user wants you
